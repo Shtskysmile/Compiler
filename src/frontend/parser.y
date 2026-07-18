@@ -10,7 +10,7 @@
 %locations
 
 %code requires {
-#include "internal.hpp"
+#include "../internal.hpp"
 }
 
 %parse-param { ParseContext& ctx }

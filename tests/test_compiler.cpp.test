@@ -1,5 +1,5 @@
-#include "sysy/compiler.hpp"
-#include "ir.hpp"
+#include "../include/sysy/compiler.hpp"
+#include "../src/ir.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -200,6 +200,8 @@ void test_o1_keeps_scalars_in_callee_saved_registers() {
   CHECK(contains(result.assembly, "mv s1, a0"));
   CHECK(contains(result.assembly, "fmv.s fs0, fa0"));
   CHECK(contains(result.assembly, "fmv.w.x fs8, a0"));
+  CHECK(contains(result.assembly, "addiw s2, s2, 1"));
+  CHECK(contains(result.assembly, "fadd.s fs1, fs1, ft0"));
   CHECK(contains(result.assembly, "ld s1,"));
   CHECK(contains(result.assembly, "fld fs0,"));
 }
@@ -208,12 +210,22 @@ void test_o1_fuses_simple_array_addressing() {
   sysy::CompileOptions options;
   options.optimization = sysy::OptimizationLevel::O1;
   auto result = sysy::compile_source(
-      "int data[16]; int main(){int i=getint(); return data[i];}",
+      "int data[16]; int main(){int i=getint(); data[i]=7; return data[i*2];}",
       "addressing.sy", options);
   CHECK(result.ok);
   CHECK(contains(result.assembly, "slli t1, t1, 2"));
   CHECK(!contains(result.assembly, "li t2, 4"));
   CHECK(!contains(result.assembly, "sd t0,"));
+}
+
+void test_branches_fall_through_to_true_blocks() {
+  auto result = sysy::compile_source(
+      "int main(){int i=0; while(i<3)i=i+1; if(i>1)return i; return 0;}",
+      "fallthrough.sy");
+  CHECK(result.ok);
+  CHECK(!contains(result.assembly, "j .Lmain_while_body"));
+  CHECK(!contains(result.assembly, "j .Lmain_if_true"));
+  CHECK(!contains(result.assembly, "mv t1, t0\n  mv t0, t1"));
 }
 
 void test_o1_forwards_immediately_consumed_temporaries() {
@@ -224,6 +236,12 @@ void test_o1_forwards_immediately_consumed_temporaries() {
       "forward.sy", options);
   CHECK(result.ok);
   CHECK(!contains_adjacent_temp_round_trip(result.assembly));
+
+  auto tree = sysy::compile_source(
+      "int calc(int a,int b,int c){return a+b*c;} int main(){return 0;}",
+      "tree.sy", options);
+  CHECK(tree.ok);
+  CHECK(!contains(tree.assembly, "sw t0,"));
 }
 
 void test_o1_inlines_small_leaf_functions_once() {
@@ -256,6 +274,18 @@ void test_o1_hoists_readonly_globals_without_calls() {
   CHECK(result.ok);
   CHECK(contains(result.assembly, "lw s2, 0(t6)"));
   CHECK(contains(result.assembly, "mv t1, s2"));
+
+  auto mutable_result = sysy::compile_source(R"(
+    int state;
+    int step(int n) {
+      while (n > 0) { state = state + 1; n = n - 1; }
+      return state;
+    }
+    int main() { state = 2; return step(3); }
+  )", "global-writeback.sy", options);
+  CHECK(mutable_result.ok);
+  CHECK(count_occurrences(mutable_result.assembly, "lla t6, state") == 2);
+  CHECK(contains(mutable_result.assembly, "sw s2, 0(t6)"));
 }
 
 void test_typed_ir_optimizations_and_linear_scan() {
@@ -367,6 +397,7 @@ int main() {
   test_source_limit();
   test_o1_keeps_scalars_in_callee_saved_registers();
   test_o1_fuses_simple_array_addressing();
+  test_branches_fall_through_to_true_blocks();
   test_o1_forwards_immediately_consumed_temporaries();
   test_o1_inlines_small_leaf_functions_once();
   test_o1_hoists_readonly_globals_without_calls();

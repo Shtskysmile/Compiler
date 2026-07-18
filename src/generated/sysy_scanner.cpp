@@ -301,7 +301,7 @@ typedef flex_uint8_t YY_CHAR;
 
 #define yytext_ptr yytext
 
-#include <FlexLexer.h>
+#include "../third_party/FlexLexer.h"
 
 int yyFlexLexer::yywrap() { return 1; }
 int yyFlexLexer::yylex()
@@ -508,7 +508,7 @@ static const flex_int16_t yy_chk[307] =
 #define YY_NO_INPUT 1
 
 #line 5 "src/frontend/scanner.l"
-#include "frontend/scanner.hpp"
+#include "../frontend/scanner.hpp"
 
 #define YY_USER_ACTION begin_token(YYText(), YYLeng());
 
@@ -1866,5 +1866,4 @@ void yyfree (void * ptr )
 #define YYTABLES_NAME "yytables"
 
 #line 73 "src/frontend/scanner.l"
-
 

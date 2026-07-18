@@ -1,6 +1,6 @@
 #pragma once
 
-#include "sysy/compiler.hpp"
+#include "../include/sysy/compiler.hpp"
 
 #include <cstdint>
 #include <memory>

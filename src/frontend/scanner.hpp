@@ -1,9 +1,9 @@
 #pragma once
 
-#include "internal.hpp"
+#include "../internal.hpp"
 
 #ifndef yyFlexLexerOnce
-#include <FlexLexer.h>
+#include "../third_party/FlexLexer.h"
 #endif
 #include <istream>
 #include <string>

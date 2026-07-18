@@ -2,7 +2,7 @@
 %x COMMENT
 
 %{
-#include "frontend/scanner.hpp"
+#include "../frontend/scanner.hpp"
 
 #define YY_USER_ACTION begin_token(YYText(), YYLeng());
 

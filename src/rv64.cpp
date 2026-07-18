@@ -103,6 +103,19 @@ std::string forward_adjacent_temporaries(const std::string& assembly) {
   std::ostringstream output;
   for (std::size_t i = 0; i < lines.size(); ++i) {
     std::string line = lines[i];
+    if (line.rfind("  mv ", 0) == 0) {
+      const std::size_t comma = line.find(", ");
+      if (comma != std::string::npos) {
+        const std::string destination = line.substr(5, comma - 5);
+        const std::string source = line.substr(comma + 2);
+        if (destination == source) continue;
+        if (i + 1 < lines.size() && lines[i + 1] == "  mv " + source + ", " + destination) {
+          output << line << '\n';
+          ++i;
+          continue;
+        }
+      }
+    }
     const std::size_t marker = line.find(kMarker);
     if (marker == std::string::npos) {
       output << line << '\n';
@@ -694,6 +707,34 @@ class Generator {
     return value;
   }
 
+  Value transient_int(const std::string& reg) const {
+    Value value;
+    value.kind = ValueKind::IntRegister;
+    value.type = Type{BaseType::Int, {}, false};
+    value.label = reg;
+    return value;
+  }
+
+  Value transient_float(const std::string& reg) const {
+    Value value;
+    value.kind = ValueKind::FloatRegister;
+    value.type = Type{BaseType::Float, {}, false};
+    value.label = reg;
+    return value;
+  }
+
+  Value finish_int_result(const std::string& reg, bool transient) {
+    if (!transient) return store_int_temp(reg);
+    if (reg != "t1") line("mv t1, " + reg);
+    return transient_int("t1");
+  }
+
+  Value finish_float_result(const std::string& reg, bool transient) {
+    if (!transient) return store_float_temp(reg);
+    if (reg != "ft1") line("fmv.s ft1, " + reg);
+    return transient_float("ft1");
+  }
+
   bool is_simple_index(const Expr& expression) const {
     if (expression.kind == ExprKind::Int || expression.kind == ExprKind::Float ||
         expression.kind == ExprKind::Name)
@@ -725,19 +766,31 @@ class Generator {
     }
     if (expression.kind != ExprKind::Subscript)
       fail(expression.loc, "left side of assignment is not an lvalue");
-    Type base_type = address_to_register(*expression.left);
-    if (!base_type.is_array_like()) fail(expression.loc, "subscript requires an array");
+    Type base_type;
     Value index;
-    if (is_simple_index(*expression.right)) {
+    bool index_loaded = false;
+    if (!is_simple_index(*expression.right) && expression.left->kind == ExprKind::Name) {
       index = emit_expr(*expression.right);
+      if (index.type.base != BaseType::Int || !index.type.is_scalar())
+        fail(expression.right->loc, "array index must have int type");
+      load_int(index, "t1");
+      index_loaded = true;
+      base_type = address_to_register(*expression.left);
     } else {
+      base_type = address_to_register(*expression.left);
+      if (!base_type.is_array_like()) fail(expression.loc, "subscript requires an array");
+    }
+    if (!index_loaded && is_simple_index(*expression.right)) {
+      index = emit_expr(*expression.right);
+    } else if (!index_loaded) {
       Value saved_base = make_pointer_temp(base_type, "t0");
       index = emit_expr(*expression.right);
       load_pointer(saved_base, "t0");
     }
+    if (!base_type.is_array_like()) fail(expression.loc, "subscript requires an array");
     if (index.type.base != BaseType::Int || !index.type.is_scalar())
       fail(expression.right->loc, "array index must have int type");
-    load_int(index, "t1");
+    if (!index_loaded) load_int(index, "t1");
     std::uint64_t stride = 4;
     std::vector<std::int64_t> remaining = base_type.dimensions;
     if (!remaining.empty()) remaining.erase(remaining.begin());
@@ -802,10 +855,40 @@ class Generator {
         return store_int_temp("t1");
       }
       case ExprKind::Unary: return emit_unary(expression);
-      case ExprKind::Binary: return emit_binary(expression);
+      case ExprKind::Binary: return emit_binary(expression, false);
       case ExprKind::Call: return emit_call(expression);
     }
     fail(expression.loc, "unsupported expression");
+  }
+
+  Value emit_expr_transient(const Expr& expression) {
+    if (expression.kind == ExprKind::Subscript) {
+      Type type = address_to_register(expression);
+      if (!type.dimensions.empty()) return make_pointer_temp(type, "t0");
+      if (type.base == BaseType::Float) {
+        line("flw ft1, 0(t0)");
+        return transient_float("ft1");
+      }
+      line("lw t1, 0(t0)");
+      return transient_int("t1");
+    }
+    if (expression.kind == ExprKind::Binary && expression.text != "&&" &&
+        expression.text != "||")
+      return emit_binary(expression, true);
+    if (expression.kind == ExprKind::Unary && expression.text != "!") {
+      Value inner = emit_expr_transient(*expression.left);
+      if (!inner.type.is_scalar()) fail(expression.loc, "unary operator requires a scalar");
+      if (expression.text == "+") return inner;
+      if (inner.type.base == BaseType::Float) {
+        load_float(inner, "ft0");
+        line("fneg.s ft0, ft0");
+        return finish_float_result("ft0", true);
+      }
+      load_int(inner, "t0");
+      line("negw t0, t0");
+      return finish_int_result("t0", true);
+    }
+    return emit_expr(expression);
   }
 
   Value emit_unary(const Expr& expression) {
@@ -823,11 +906,11 @@ class Generator {
     return store_int_temp("t0");
   }
 
-  Value emit_binary(const Expr& expression) {
+  Value emit_binary(const Expr& expression, bool transient_result) {
     if (expression.text == "&&" || expression.text == "||")
       return materialize_bool(expression);
     Value left = emit_expr(*expression.left);
-    Value right = emit_expr(*expression.right);
+    Value right = emit_expr_transient(*expression.right);
     if (!left.type.is_scalar() || !right.type.is_scalar())
       fail(expression.loc, "binary operator requires scalar operands");
     const bool comparison = expression.text == "==" || expression.text == "!=" ||
@@ -848,14 +931,14 @@ class Generator {
         else if (expression.text == "<=") line("fle.s t0, ft0, ft1");
         else if (expression.text == ">") line("flt.s t0, ft1, ft0");
         else line("fle.s t0, ft1, ft0");
-        return store_int_temp("t0");
+        return finish_int_result("t0", transient_result);
       }
       if (expression.text == "+") line("fadd.s ft0, ft0, ft1");
       else if (expression.text == "-") line("fsub.s ft0, ft0, ft1");
       else if (expression.text == "*") line("fmul.s ft0, ft0, ft1");
       else if (expression.text == "/") line("fdiv.s ft0, ft0, ft1");
       else fail(expression.loc, "unsupported floating operator");
-      return store_float_temp("ft0");
+      return finish_float_result("ft0", transient_result);
     }
     load_int(left, "t0");
     load_int(right, "t1");
@@ -875,7 +958,7 @@ class Generator {
         line("slt t0, t0, t1");
         line("xori t0, t0, 1");
       }
-      return store_int_temp("t0");
+      return finish_int_result("t0", transient_result);
     }
     if (expression.text == "+") line("addw t0, t0, t1");
     else if (expression.text == "-") line("subw t0, t0, t1");
@@ -883,7 +966,7 @@ class Generator {
     else if (expression.text == "/") line("divw t0, t0, t1");
     else if (expression.text == "%") line("remw t0, t0, t1");
     else fail(expression.loc, "unsupported integer operator");
-    return store_int_temp("t0");
+    return finish_int_result("t0", transient_result);
   }
 
   void emit_cond(const Expr& expression, const std::string& true_label,
@@ -918,6 +1001,40 @@ class Generator {
       line("beqz t0, " + false_label);
     }
     line("j " + true_label);
+  }
+
+  void emit_cond_fallthrough_true(const Expr& expression, const std::string& false_label) {
+    if (expression.kind == ExprKind::Binary && expression.text == "&&") {
+      emit_cond_fallthrough_true(*expression.left, false_label);
+      emit_cond_fallthrough_true(*expression.right, false_label);
+      return;
+    }
+    if (expression.kind == ExprKind::Binary && expression.text == "||") {
+      const std::string rhs = new_label("or_rhs");
+      const std::string pass = new_label("or_true");
+      emit_cond(*expression.left, pass, rhs);
+      label(rhs);
+      emit_cond_fallthrough_true(*expression.right, false_label);
+      label(pass);
+      return;
+    }
+    if (expression.kind == ExprKind::Unary && expression.text == "!") {
+      const std::string pass = new_label("not_true");
+      emit_cond(*expression.left, false_label, pass);
+      label(pass);
+      return;
+    }
+    Value value = emit_expr(expression);
+    if (!value.type.is_scalar()) fail(expression.loc, "condition must be scalar");
+    if (value.type.base == BaseType::Float) {
+      load_float(value, "ft0");
+      line("fmv.w.x ft1, zero");
+      line("feq.s t0, ft0, ft1");
+      line("bnez t0, " + false_label);
+    } else {
+      load_int(value, "t0");
+      line("beqz t0, " + false_label);
+    }
   }
 
   Value materialize_bool(const Expr& expression) {
@@ -1191,6 +1308,17 @@ class Generator {
     }
   }
 
+  void store_to_current_address(const Type& type, const Value& value, Loc loc) {
+    if (!type.dimensions.empty()) fail(loc, "cannot assign to an array");
+    if (type.base == BaseType::Float) {
+      load_float(value, "ft0");
+      line("fsw ft0, 0(t0)");
+    } else {
+      load_int(value, "t1");
+      line("sw t1, 0(t0)");
+    }
+  }
+
   void store_to_symbol(Symbol& symbol, const Value& value, Loc loc) {
     if (symbol.storage == Storage::IntRegister) {
       load_int(value, symbol.reg);
@@ -1202,6 +1330,59 @@ class Generator {
     }
     Value address = address_of_name(symbol);
     store_to_address(address, value, loc);
+  }
+
+  bool emit_register_self_update(Symbol& symbol, const std::string& name,
+                                 const Expr& expression) {
+    if (expression.kind != ExprKind::Binary || !expression.left || !expression.right ||
+        expression.left->kind != ExprKind::Name || expression.left->text != name)
+      return false;
+    const std::string& op = expression.text;
+    if (op != "+" && op != "-" && op != "*" && op != "/") return false;
+
+    Value right = emit_expr_transient(*expression.right);
+    if (!right.type.is_scalar()) fail(expression.loc, "binary operator requires scalar operands");
+    if (symbol.storage == Storage::IntRegister && right.type.base == BaseType::Int) {
+      if (op == "+" || op == "-") {
+        auto constant = eval_const(*expression.right);
+        if (constant && constant->base == BaseType::Int) {
+          const std::int64_t delta = op == "+" ? constant->integer
+                                                : -static_cast<std::int64_t>(constant->integer);
+          if (delta >= -2048 && delta <= 2047) {
+            line("addiw " + symbol.reg + ", " + symbol.reg + ", " +
+                 std::to_string(delta));
+            return true;
+          }
+        }
+      }
+      const std::string right_reg =
+          right.kind == ValueKind::IntRegister ? right.label : "t0";
+      if (right_reg == "t0") load_int(right, right_reg);
+      const std::string instruction =
+          op == "+" ? "addw" : op == "-" ? "subw" : op == "*" ? "mulw" : "divw";
+      line(instruction + " " + symbol.reg + ", " + symbol.reg + ", " + right_reg);
+      return true;
+    }
+
+    if (symbol.storage == Storage::FloatRegister) {
+      load_float(right, "ft0");
+      const std::string instruction =
+          op == "+" ? "fadd.s" : op == "-" ? "fsub.s" : op == "*" ? "fmul.s" : "fdiv.s";
+      line(instruction + " " + symbol.reg + ", " + symbol.reg + ", ft0");
+      return true;
+    }
+
+    if (symbol.storage == Storage::IntRegister && right.type.base == BaseType::Float) {
+      Value current = local_value(symbol);
+      load_float(current, "ft0");
+      load_float(right, "ft1");
+      const std::string instruction =
+          op == "+" ? "fadd.s" : op == "-" ? "fsub.s" : op == "*" ? "fmul.s" : "fdiv.s";
+      line(instruction + " ft0, ft0, ft1");
+      line("fcvt.w.s " + symbol.reg + ", ft0, rtz");
+      return true;
+    }
+    return false;
   }
 
   struct SavedRegister {
@@ -1319,10 +1500,34 @@ class Generator {
         if (direct && direct->is_const)
           fail(statement.loc, "cannot assign to const '" + statement.expression->text + "'");
         if (direct) direct->constant.reset();
+        auto global_binding = statement.expression->kind == ExprKind::Name
+                                  ? global_register_bindings_.find(statement.expression->text)
+                                  : global_register_bindings_.end();
+        if (global_binding != global_register_bindings_.end()) {
+          Symbol cached;
+          cached.type = global_binding->second.type;
+          cached.reg = global_binding->second.label;
+          cached.storage = cached.type.base == BaseType::Float ? Storage::FloatRegister
+                                                               : Storage::IntRegister;
+          if (emit_register_self_update(cached, statement.expression->text, *statement.value))
+            return;
+          Value value = emit_expr(*statement.value);
+          store_to_symbol(cached, value, statement.loc);
+          return;
+        }
         if (direct && (direct->storage == Storage::IntRegister ||
                        direct->storage == Storage::FloatRegister)) {
+          if (emit_register_self_update(*direct, statement.expression->text, *statement.value))
+            return;
           Value value = emit_expr(*statement.value);
           store_to_symbol(*direct, value, statement.loc);
+          return;
+        }
+        if (!direct && statement.expression->kind == ExprKind::Subscript &&
+            is_simple_index(*statement.value)) {
+          Type type = address_to_register(*statement.expression);
+          Value value = emit_expr(*statement.value);
+          store_to_current_address(type, value, statement.loc);
           return;
         }
         Value address = address_of(*statement.expression);
@@ -1342,7 +1547,7 @@ class Generator {
         const std::string yes = new_label("if_true");
         const std::string no = new_label("if_false");
         const std::string done = new_label("if_done");
-        emit_cond(*statement.expression, yes, no);
+        emit_cond_fallthrough_true(*statement.expression, no);
         label(yes);
         emit_stmt(*statement.first);
         line("j " + done);
@@ -1356,7 +1561,7 @@ class Generator {
         const std::string body = new_label("while_body");
         const std::string done = new_label("while_done");
         label(head);
-        emit_cond(*statement.expression, body, done);
+        emit_cond_fallthrough_true(*statement.expression, done);
         label(body);
         break_labels_.push_back(done);
         continue_labels_.push_back(head);
@@ -1473,10 +1678,19 @@ class Generator {
     bool has_call = false;
     collect_statement_global_reads(*function.body, reads, has_call);
     if (has_call) return;
+    for (const std::string& name : assigned_names_) {
+      auto global = globals_by_name_.find(name);
+      if (!declared.count(name) && global != globals_by_name_.end() &&
+          global->second.type.is_scalar() && !global->second.is_const) {
+        reads.insert(name);
+        global_writeback_names_.push_back(name);
+      }
+    }
+    std::sort(global_writeback_names_.begin(), global_writeback_names_.end());
     std::vector<std::string> ordered(reads.begin(), reads.end());
     std::sort(ordered.begin(), ordered.end());
     for (const std::string& name : ordered) {
-      if (declared.count(name) || assigned_names_.count(name)) continue;
+      if (declared.count(name)) continue;
       const Symbol& global = globals_by_name_.at(name);
       Symbol cached;
       cached.type = global.type;
@@ -1546,6 +1760,7 @@ class Generator {
     saved_float_registers_.fill(false);
     saved_registers_.clear();
     global_register_bindings_.clear();
+    global_writeback_names_.clear();
     assigned_names_.clear();
     collect_assigned_names(*function.body);
     scopes_.clear();
@@ -1586,6 +1801,7 @@ class Generator {
     emit_param_spills(incoming, param_stream);
     std::ostringstream save_stream;
     std::ostringstream restore_stream;
+    std::ostringstream global_writeback_stream;
     std::ostringstream* previous = current_stream_;
     current_stream_ = &save_stream;
     for (const SavedRegister& saved : saved_registers_)
@@ -1593,6 +1809,17 @@ class Generator {
     current_stream_ = &restore_stream;
     for (auto it = saved_registers_.rbegin(); it != saved_registers_.rend(); ++it)
       load_local(it->floating ? "fld" : "ld", it->name, it->offset);
+    current_stream_ = &global_writeback_stream;
+    for (const std::string& name : global_writeback_names_) {
+      auto binding = global_register_bindings_.find(name);
+      if (binding == global_register_bindings_.end()) continue;
+      const Symbol& global = globals_by_name_.at(name);
+      line("lla t6, " + global.label);
+      if (global.type.base == BaseType::Float)
+        line("fsw " + binding->second.label + ", 0(t6)");
+      else
+        line("sw " + binding->second.label + ", 0(t6)");
+    }
     current_stream_ = previous;
     const std::uint64_t frame = align_up(next_offset_, 16);
     output_ << ".section .text\n.align 2\n.globl " << function.name << '\n'
@@ -1604,7 +1831,7 @@ class Generator {
             << "  sd s0, -16(t1)\n"
             << "  mv s0, t1\n"
             << save_stream.str() << param_stream.str() << body.str() << epilogue_label_ << ":\n"
-            << restore_stream.str()
+            << global_writeback_stream.str() << restore_stream.str()
             << "  ld ra, -8(s0)\n"
             << "  ld t0, -16(s0)\n"
             << "  mv sp, s0\n"
@@ -1639,6 +1866,7 @@ class Generator {
   std::vector<SavedRegister> saved_registers_;
   std::vector<std::unordered_map<std::string, Value>> inline_bindings_;
   std::unordered_map<std::string, Value> global_register_bindings_;
+  std::vector<std::string> global_writeback_names_;
 };
 
 }  // namespace

@@ -1,4 +1,4 @@
-#include "sysy/compiler.hpp"
+#include "../include/sysy/compiler.hpp"
 
 #include <array>
 #include <cstdio>

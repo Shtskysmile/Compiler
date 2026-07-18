@@ -47,7 +47,7 @@
 // "%code requires" blocks.
 #line 12 "src/frontend/parser.y"
 
-#include "internal.hpp"
+#include "../internal.hpp"
 
 #line 53 "src/generated/sysy_parser.hpp"
 

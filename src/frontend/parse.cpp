@@ -1,6 +1,6 @@
-#include "internal.hpp"
-#include "frontend/scanner.hpp"
-#include "generated/sysy_parser.hpp"
+#include "../internal.hpp"
+#include "scanner.hpp"
+#include "../generated/sysy_parser.hpp"
 
 #include <cerrno>
 #include <cstdlib>

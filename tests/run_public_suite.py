@@ -94,7 +94,8 @@ def execute_case(args, archive_path, name, source, input_data, expected, root):
         return name, "compiler failed: " + compiled.stderr.decode(errors="replace")
 
     link_command = [args.cross_cc, "-static", "-march=rv64gc", "-mabi=lp64d",
-                    "-mcmodel=medany", str(asm_path), str(args.runtime)]
+                    "-mcmodel=medany", str(asm_path), "-x", "c", str(args.runtime),
+                    "-x", "none"]
     if args.embedded_input:
         input_path = root / f"{stem}.in"
         embedded_path = root / f"{stem}_input.S"
@@ -134,7 +135,8 @@ def main():
     parser.add_argument("--cross-cc", default="riscv64-unknown-elf-gcc")
     parser.add_argument("--spike", type=pathlib.Path, default=pathlib.Path("spike"))
     parser.add_argument("--pk", type=pathlib.Path, required=True)
-    parser.add_argument("--runtime", type=pathlib.Path, default=pathlib.Path(__file__).with_name("rv_runtime.c"))
+    parser.add_argument("--runtime", type=pathlib.Path,
+                        default=pathlib.Path(__file__).with_name("rv_runtime.c.test"))
     parser.add_argument("--optimize", action="store_true")
     parser.add_argument("--embedded-input", action="store_true",
                         help="link case input into the test runtime instead of using a PTY")

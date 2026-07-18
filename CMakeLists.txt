@@ -30,7 +30,11 @@ add_executable(compiler src/main.cpp)
 target_link_libraries(compiler PRIVATE sysy_compiler_core)
 
 enable_testing()
-add_executable(sysy_unit_tests tests/test_compiler.cpp)
+set(SYSY_UNIT_TEST_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_compiler.cpp.test)
+set_source_files_properties(${SYSY_UNIT_TEST_SOURCE} PROPERTIES
+  LANGUAGE CXX
+  COMPILE_OPTIONS "-x;c++")
+add_executable(sysy_unit_tests ${SYSY_UNIT_TEST_SOURCE})
 target_link_libraries(sysy_unit_tests PRIVATE sysy_compiler_core)
 target_include_directories(sysy_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME sysy_unit_tests COMMAND sysy_unit_tests)
