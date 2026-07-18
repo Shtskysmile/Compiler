@@ -249,6 +249,104 @@ void test_o1_keeps_hot_pointer_parameters_in_registers() {
   CHECK(!contains(result.assembly, "sd a0,"));
 }
 
+void test_o1_reuses_registers_for_shadowed_locals_with_disjoint_lifetimes() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int main() {
+      int sum = 0;
+      {
+        int i = 0;
+        while (i < 8) {
+          sum = sum + i;
+          i = i + 1;
+        }
+      }
+      {
+        int i = 0;
+        while (i < 8) {
+          sum = sum + i;
+          i = i + 1;
+        }
+      }
+      return sum;
+    }
+  )", "shadowed-registers.sy", options);
+  CHECK(result.ok);
+  CHECK(!contains(result.assembly, "lw "));
+  CHECK(!contains(result.assembly, "sw "));
+}
+
+void test_o1_eliminates_repeated_array_loads_within_an_expression() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int values[16];
+    int square(int i) {
+      return values[i] * values[i];
+    }
+    int main() { return 0; }
+  )", "array-load-cse.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "lw t1, 0(t0)") == 1);
+}
+
+void test_o1_does_not_save_global_array_bases_in_recursive_frames() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int values[16];
+    int sum(int n) {
+      if (n == 0) return 0;
+      return values[n] + sum(n - 1);
+    }
+    int main() { return 0; }
+  )", "recursive-array-base.sy", options);
+  CHECK(result.ok);
+  CHECK(!contains(result.assembly, "lla s"));
+}
+
+void test_o1_strength_reduces_loop_array_addresses_to_pointer_increments() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int values[64];
+    int main() {
+      int i = 0;
+      int sum = 0;
+      while (i < 64) {
+        sum = sum + values[i];
+        i = i + 1;
+      }
+      return sum;
+    }
+  )", "loop-pointer-induction.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "# sysy-loop-induction-address"));
+  CHECK(contains(result.assembly, "addi a4, a4, 4"));
+}
+
+void test_o1_inducts_the_complete_multidimensional_address() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int values[16][16];
+    int column_sum(int j) {
+      int k = 0;
+      int sum = 0;
+      while (k < 16) {
+        sum = sum + values[k][j];
+        k = k + 1;
+      }
+      return sum;
+    }
+    int main() { return 0; }
+  )", "multidimensional-loop-pointer.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "mv t0, a4\n  lw t1, 0(t0)"));
+  CHECK(contains(result.assembly, "addi a4, a4, 64"));
+}
+
 void test_o1_strength_reduces_signed_power_of_two_division() {
   sysy::CompileOptions options;
   options.optimization = sysy::OptimizationLevel::O1;
@@ -264,6 +362,78 @@ void test_o1_strength_reduces_signed_power_of_two_division() {
   CHECK(contains(result.assembly, "sraiw"));
   CHECK(contains(result.assembly, "andi"));
   CHECK(contains(result.assembly, "slliw s1, s1, 3"));
+}
+
+void test_o1_keeps_array_values_and_destinations_in_scratch_registers() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    void update(int a[], int b[], int c[], int i) {
+      c[i] = a[i] * b[i] + c[i];
+    }
+    int main(){return 0;}
+  )", "array-scratch.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "mv t3, t1"));
+  CHECK(contains(result.assembly, "mv t4, t0"));
+  CHECK(!contains(result.assembly, "sw t1, -"));
+  CHECK(!contains(result.assembly, "sd t0, -"));
+}
+
+void test_o1_caches_hot_global_array_bases() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int a[64];
+    int b[64];
+    int main() {
+      int i = 0;
+      int sum = 0;
+      while (i < 64) {
+        sum = sum + a[i] * b[i];
+        i = i + 1;
+      }
+      return sum;
+    }
+  )", "global-array-bases.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "lla ") == 2);
+  CHECK(contains(result.assembly, "lla s"));
+  CHECK(!contains(result.assembly, "lla t0, a"));
+  CHECK(!contains(result.assembly, "lla t0, b"));
+}
+
+void test_o1_hoists_loop_invariant_array_addresses() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    void mm(int a[][16], int b[][16], int c[][16], int i, int k, int n) {
+      int j = 0;
+      while (j < n) {
+        c[i][j] = a[i][k] * a[i][k] + b[k][j];
+        j = j + 1;
+      }
+    }
+    int main(){return 0;}
+  )", "loop-addresses.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "# sysy-loop-address") == 3);
+  CHECK(contains(result.assembly, "ld t0, -"));
+}
+
+void test_o1_eliminates_direct_self_tail_calls() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int countdown(int n, int total) {
+      if (n == 0) return total;
+      return countdown(n - 1, total + n);
+    }
+    int main(){return countdown(10, 0);}
+  )", "tail-call.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "call countdown") == 1);
+  CHECK(contains(result.assembly, "j .Lcountdown_tail_entry"));
 }
 
 void test_branches_fall_through_to_true_blocks() {
@@ -492,7 +662,16 @@ int main() {
   test_o1_keeps_scalars_in_callee_saved_registers();
   test_o1_fuses_simple_array_addressing();
   test_o1_keeps_hot_pointer_parameters_in_registers();
+  test_o1_reuses_registers_for_shadowed_locals_with_disjoint_lifetimes();
+  test_o1_eliminates_repeated_array_loads_within_an_expression();
+  test_o1_does_not_save_global_array_bases_in_recursive_frames();
+  test_o1_strength_reduces_loop_array_addresses_to_pointer_increments();
+  test_o1_inducts_the_complete_multidimensional_address();
   test_o1_strength_reduces_signed_power_of_two_division();
+  test_o1_keeps_array_values_and_destinations_in_scratch_registers();
+  test_o1_caches_hot_global_array_bases();
+  test_o1_hoists_loop_invariant_array_addresses();
+  test_o1_eliminates_direct_self_tail_calls();
   test_branches_fall_through_to_true_blocks();
   test_o1_forwards_immediately_consumed_temporaries();
   test_o1_inlines_small_leaf_functions_once();

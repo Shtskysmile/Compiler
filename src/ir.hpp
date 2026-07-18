@@ -86,6 +86,9 @@ struct RegisterPlan {
   std::unordered_map<std::string, std::size_t> floats;
 };
 
+std::string source_register_key(const std::string& name, std::size_t line,
+                                std::size_t column);
+
 std::unordered_map<std::string, RegisterPlan> plan_source_registers(
     const Program& program, std::size_t integer_registers, std::size_t float_registers);
 

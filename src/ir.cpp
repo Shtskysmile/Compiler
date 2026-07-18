@@ -88,6 +88,11 @@ Block* find_block(Function& function, BlockId id) {
 
 }  // namespace
 
+std::string source_register_key(const std::string& name, std::size_t line,
+                                std::size_t column) {
+  return name + "@" + std::to_string(line) + ":" + std::to_string(column);
+}
+
 bool is_pure(const Instruction& instruction) {
   switch (instruction.opcode) {
     case Opcode::ConstInt:
@@ -338,7 +343,7 @@ class SourceRegisterPlanner {
       if (param.is_array)
         pointer_parameters_.insert(param.name);
       else
-        declare(param.name, param.base);
+        declare(param.name, param.base, param.loc);
     }
     walk_statement(*source_.body);
     propagate_constants_and_copies(function_);
@@ -350,13 +355,13 @@ class SourceRegisterPlanner {
     RegisterPlan plan;
     for (const auto& item : variables_) {
       const Variable& variable = item.second;
-      if (variable.uses == 0 || name_counts_[variable.name] != 1) continue;
+      if (variable.uses == 0) continue;
       auto allocation = allocations.find(variable.value);
       if (allocation == allocations.end()) continue;
       if (allocation->second.kind == Allocation::Kind::IntegerRegister)
-        plan.integers[variable.name] = allocation->second.index;
+        plan.integers[variable.key] = allocation->second.index;
       else if (allocation->second.kind == Allocation::Kind::FloatRegister)
-        plan.floats[variable.name] = allocation->second.index;
+        plan.floats[variable.key] = allocation->second.index;
     }
     std::set<std::size_t> used_integer_registers;
     for (const auto& item : plan.integers) used_integer_registers.insert(item.second);
@@ -366,7 +371,7 @@ class SourceRegisterPlanner {
       std::size_t reg = 0;
       while (reg < integer_registers_ && used_integer_registers.count(reg)) ++reg;
       if (reg == integer_registers_) break;
-      plan.integers[param.name] = reg;
+      plan.integers[source_register_key(param.name, param.loc.line, param.loc.column)] = reg;
       used_integer_registers.insert(reg);
     }
     return plan;
@@ -375,17 +380,18 @@ class SourceRegisterPlanner {
  private:
   struct Variable {
     std::string name;
+    std::string key;
     ValueId value{};
     Type type{Type::I32};
     std::size_t uses{};
   };
 
-  void declare(const std::string& name, BaseType base) {
+  void declare(const std::string& name, BaseType base, Loc loc) {
     const ValueId value = next_value_++;
     const Type type = base == BaseType::Float ? Type::F32 : Type::I32;
     scopes_.back()[name] = value;
-    variables_[value] = Variable{name, value, type, 0};
-    ++name_counts_[name];
+    variables_[value] = Variable{
+        name, source_register_key(name, loc.line, loc.column), value, type, 0};
     Instruction definition;
     definition.opcode = Opcode::Address;
     definition.type = type;
@@ -460,7 +466,8 @@ class SourceRegisterPlanner {
     if (statement.kind == StmtKind::Declaration) {
       for (const VarDecl& declaration : statement.declarations) {
         for (const auto& dimension : declaration.dimensions) walk_expression(*dimension);
-        if (declaration.dimensions.empty()) declare(declaration.name, declaration.base);
+        if (declaration.dimensions.empty())
+          declare(declaration.name, declaration.base, declaration.loc);
         if (declaration.initializer) walk_initializer(*declaration.initializer);
       }
     } else {
@@ -482,7 +489,6 @@ class SourceRegisterPlanner {
   ValueId next_value_{1};
   std::vector<std::unordered_map<std::string, ValueId>> scopes_;
   std::unordered_map<ValueId, Variable> variables_;
-  std::unordered_map<std::string, std::size_t> name_counts_;
   std::vector<std::unordered_set<ValueId>> active_loop_uses_;
   std::unordered_set<std::string> pointer_parameters_;
   bool has_nonlocal_name_{};

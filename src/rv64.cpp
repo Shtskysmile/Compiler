@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <limits>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -773,6 +774,15 @@ class Generator {
     return value;
   }
 
+  Value transient_pointer(Type type, const std::string& reg) const {
+    Value value;
+    value.kind = ValueKind::PointerRegister;
+    value.type = std::move(type);
+    value.type.is_pointer = true;
+    value.label = reg;
+    return value;
+  }
+
   Value finish_int_result(const std::string& reg, bool transient) {
     if (!transient) return store_int_temp(reg);
     if (reg != "t1") line("mv t1, " + reg);
@@ -832,6 +842,14 @@ class Generator {
   }
 
   Type address_to_register(const Expr& expression) {
+    for (auto frame = loop_address_bindings_.rbegin();
+         frame != loop_address_bindings_.rend(); ++frame) {
+      for (const LoopAddressBinding& binding : *frame) {
+        if (!expressions_equivalent(*binding.expression, expression)) continue;
+        load_pointer(binding.address, "t0");
+        return binding.address.type;
+      }
+    }
     if (expression.kind == ExprKind::Name) {
       for (auto it = inline_bindings_.rbegin(); it != inline_bindings_.rend(); ++it) {
         auto binding = it->find(expression.text);
@@ -845,7 +863,11 @@ class Generator {
       Symbol* symbol = find_symbol(expression.text);
       if (!symbol) fail(expression.loc, "undefined identifier '" + expression.text + "'");
       if (symbol->storage == Storage::Global) {
-        line("lla t0, " + symbol->label);
+        auto cached = global_array_register_bindings_.find(expression.text);
+        if (cached != global_array_register_bindings_.end())
+          line("mv t0, " + cached->second);
+        else
+          line("lla t0, " + symbol->label);
       } else if (symbol->storage == Storage::ParamPointer) {
         load_local("ld", "t0", symbol->offset);
       } else if (symbol->storage == Storage::PointerRegister) {
@@ -1006,11 +1028,40 @@ class Generator {
       left_spine.push_back(first);
       first = first->left.get();
     }
-    Value result = emit_expr(*first);
+    Value result;
+    bool scratch_preserved = false;
+    const bool can_preserve = options_.optimization == OptimizationLevel::O1 &&
+                              first->kind == ExprKind::Subscript &&
+                              !array_value_scratch_in_use_ && !left_spine.empty() &&
+                              !expression_contains_call(*left_spine.back()->right);
+    if (can_preserve) {
+      array_value_scratch_in_use_ = true;
+      result = emit_expr_transient(*first);
+      if (result.kind == ValueKind::IntRegister) {
+        line("mv t3, " + result.label);
+        result = transient_int("t3");
+        scratch_preserved = true;
+      } else if (result.kind == ValueKind::FloatRegister) {
+        line("fmv.s ft2, " + result.label);
+        result = transient_float("ft2");
+        scratch_preserved = true;
+      } else {
+        array_value_scratch_in_use_ = false;
+      }
+    } else {
+      result = emit_expr(*first);
+    }
     for (auto node = left_spine.rbegin(); node != left_spine.rend(); ++node) {
-      Value right = emit_expr_transient(*(*node)->right);
+      const bool reuse_array_value =
+          scratch_preserved && options_.optimization == OptimizationLevel::O1 &&
+          expressions_equivalent(*first, *(*node)->right);
+      Value right = reuse_array_value ? result : emit_expr_transient(*(*node)->right);
       const bool final = std::next(node) == left_spine.rend();
       result = emit_binary_values(**node, result, right, final && transient_result);
+      if (scratch_preserved) {
+        array_value_scratch_in_use_ = false;
+        scratch_preserved = false;
+      }
     }
     return result;
   }
@@ -1491,6 +1542,44 @@ class Generator {
     return false;
   }
 
+  bool expression_calls_function(const Expr& expression,
+                                 const std::string& function) const {
+    if (expression.kind == ExprKind::Call && expression.text == function) return true;
+    if (expression.left && expression_calls_function(*expression.left, function)) return true;
+    if (expression.right && expression_calls_function(*expression.right, function)) return true;
+    for (const auto& argument : expression.args)
+      if (expression_calls_function(*argument, function)) return true;
+    return false;
+  }
+
+  bool initializer_calls_function(const Initializer& initializer,
+                                  const std::string& function) const {
+    if (initializer.expression &&
+        expression_calls_function(*initializer.expression, function))
+      return true;
+    for (const auto& element : initializer.elements)
+      if (initializer_calls_function(*element, function)) return true;
+    return false;
+  }
+
+  bool statement_calls_function(const Stmt& statement,
+                                const std::string& function) const {
+    if (statement.expression && expression_calls_function(*statement.expression, function))
+      return true;
+    if (statement.value && expression_calls_function(*statement.value, function)) return true;
+    for (const VarDecl& declaration : statement.declarations) {
+      for (const auto& dimension : declaration.dimensions)
+        if (expression_calls_function(*dimension, function)) return true;
+      if (declaration.initializer &&
+          initializer_calls_function(*declaration.initializer, function))
+        return true;
+    }
+    for (const auto& child : statement.statements)
+      if (statement_calls_function(*child, function)) return true;
+    if (statement.first && statement_calls_function(*statement.first, function)) return true;
+    return statement.second && statement_calls_function(*statement.second, function);
+  }
+
   Value emit_inline_call(const Expr& expression, const Function& function,
                          const FunctionSig& signature, const Expr& return_expression) {
     if (expression.args.size() != signature.params.size())
@@ -1709,6 +1798,7 @@ class Generator {
           if (delta >= -2048 && delta <= 2047) {
             line("addiw " + symbol.reg + ", " + symbol.reg + ", " +
                  std::to_string(delta));
+            if (delta == 1) advance_loop_induction_addresses(name);
             return true;
           }
         }
@@ -1806,7 +1896,9 @@ class Generator {
     symbol.type = resolve_decl_type(declaration.base, declaration.dimensions);
     symbol.is_const = declaration.is_const;
     const std::uint64_t count = symbol.type.dimensions.empty() ? 1 : element_count(symbol.type);
-    assign_scalar_register(symbol, declaration.name);
+    assign_scalar_register(
+        symbol, ir::source_register_key(declaration.name, declaration.loc.line,
+                                        declaration.loc.column));
     if (symbol.storage == Storage::Local) symbol.offset = allocate(count * 4, 8);
     scope[declaration.name] = symbol;
     Symbol& stored = scope[declaration.name];
@@ -1873,6 +1965,333 @@ class Generator {
     return make_pointer_temp(symbol.type, "t0");
   }
 
+  std::string loop_pointer_register_name(std::size_t index) const {
+    return index < 11 ? "s" + std::to_string(index + 1)
+                      : "a" + std::to_string(index - 7);
+  }
+
+  std::optional<std::size_t> acquire_loop_pointer_register(bool caller_saved_allowed) {
+    if (caller_saved_allowed) {
+      for (std::size_t index = 0; index < active_loop_caller_registers_.size(); ++index) {
+        if (active_loop_caller_registers_[index]) continue;
+        active_loop_caller_registers_[index] = true;
+        return 11 + index;
+      }
+    }
+    for (std::size_t index : reusable_loop_int_registers_) {
+      if (!active_loop_int_registers_[index]) {
+        active_loop_int_registers_[index] = true;
+        return index;
+      }
+    }
+    for (std::size_t index = 0; index < saved_int_registers_.size(); ++index) {
+      if (saved_int_registers_[index] || planned_int_registers_.count(index)) continue;
+      saved_int_registers_[index] = true;
+      active_loop_int_registers_[index] = true;
+      saved_registers_.push_back(
+          SavedRegister{"s" + std::to_string(index + 1), allocate(8), false});
+      return index;
+    }
+    return std::nullopt;
+  }
+
+  void release_loop_pointer_register(std::size_t index) {
+    if (index >= 11) {
+      active_loop_caller_registers_[index - 11] = false;
+      return;
+    }
+    active_loop_int_registers_[index] = false;
+    reusable_loop_int_registers_.insert(index);
+  }
+
+  bool expression_uses_any_name(
+      const Expr& expression, const std::unordered_set<std::string>& names) const {
+    std::vector<const Expr*> pending{&expression};
+    while (!pending.empty()) {
+      const Expr* current = pending.back();
+      pending.pop_back();
+      if (current->kind == ExprKind::Name && names.count(current->text)) return true;
+      for (const auto& argument : current->args) pending.push_back(argument.get());
+      if (current->left) pending.push_back(current->left.get());
+      if (current->right) pending.push_back(current->right.get());
+    }
+    return false;
+  }
+
+  bool expressions_equivalent(const Expr& left, const Expr& right) const {
+    std::vector<std::pair<const Expr*, const Expr*>> pending{{&left, &right}};
+    while (!pending.empty()) {
+      const auto [a, b] = pending.back();
+      pending.pop_back();
+      std::uint32_t a_float{};
+      std::uint32_t b_float{};
+      std::memcpy(&a_float, &a->float_value, sizeof(a_float));
+      std::memcpy(&b_float, &b->float_value, sizeof(b_float));
+      if (a->kind != b->kind || a->text != b->text || a->int_value != b->int_value ||
+          a_float != b_float || a->args.size() != b->args.size() ||
+          static_cast<bool>(a->left) != static_cast<bool>(b->left) ||
+          static_cast<bool>(a->right) != static_cast<bool>(b->right))
+        return false;
+      if (a->left) pending.push_back({a->left.get(), b->left.get()});
+      if (a->right) pending.push_back({a->right.get(), b->right.get()});
+      for (std::size_t i = 0; i < a->args.size(); ++i)
+        pending.push_back({a->args[i].get(), b->args[i].get()});
+    }
+    return true;
+  }
+
+  bool initializer_contains_call(const Initializer& initializer) const {
+    if (initializer.expression && expression_contains_call(*initializer.expression)) return true;
+    for (const auto& element : initializer.elements)
+      if (initializer_contains_call(*element)) return true;
+    return false;
+  }
+
+  void collect_loop_excluded_names(const Stmt& statement,
+                                   std::unordered_set<std::string>& names,
+                                   bool& has_call) const {
+    if (statement.kind == StmtKind::Assignment && statement.expression &&
+        statement.expression->kind == ExprKind::Name)
+      names.insert(statement.expression->text);
+    if (statement.expression) has_call |= expression_contains_call(*statement.expression);
+    if (statement.value) has_call |= expression_contains_call(*statement.value);
+    for (const VarDecl& declaration : statement.declarations) {
+      names.insert(declaration.name);
+      for (const auto& dimension : declaration.dimensions)
+        has_call |= expression_contains_call(*dimension);
+      if (declaration.initializer)
+        has_call |= initializer_contains_call(*declaration.initializer);
+    }
+    for (const auto& child : statement.statements)
+      collect_loop_excluded_names(*child, names, has_call);
+    if (statement.first) collect_loop_excluded_names(*statement.first, names, has_call);
+    if (statement.second) collect_loop_excluded_names(*statement.second, names, has_call);
+  }
+
+  void collect_invariant_addresses(const Expr& expression,
+                                   const std::unordered_set<std::string>& excluded,
+                                   std::vector<const Expr*>& addresses) const {
+    std::vector<const Expr*> pending{&expression};
+    while (!pending.empty() && addresses.size() < 8) {
+      const Expr* current = pending.back();
+      pending.pop_back();
+      if (current->kind == ExprKind::Subscript &&
+          !expression_contains_call(*current) &&
+          !expression_uses_any_name(*current, excluded)) {
+        const bool duplicate = std::any_of(
+            addresses.begin(), addresses.end(), [&](const Expr* address) {
+              return expressions_equivalent(*address, *current);
+            });
+        if (!duplicate) addresses.push_back(current);
+        continue;
+      }
+      for (auto argument = current->args.rbegin(); argument != current->args.rend(); ++argument)
+        pending.push_back(argument->get());
+      if (current->right) pending.push_back(current->right.get());
+      if (current->left) pending.push_back(current->left.get());
+    }
+  }
+
+  void collect_initializer_invariant_addresses(
+      const Initializer& initializer, const std::unordered_set<std::string>& excluded,
+      std::vector<const Expr*>& addresses) const {
+    if (initializer.expression)
+      collect_invariant_addresses(*initializer.expression, excluded, addresses);
+    for (const auto& element : initializer.elements)
+      collect_initializer_invariant_addresses(*element, excluded, addresses);
+  }
+
+  void collect_statement_invariant_addresses(
+      const Stmt& statement, const std::unordered_set<std::string>& excluded,
+      std::vector<const Expr*>& addresses) const {
+    if (addresses.size() >= 8) return;
+    if (statement.expression)
+      collect_invariant_addresses(*statement.expression, excluded, addresses);
+    if (statement.value) collect_invariant_addresses(*statement.value, excluded, addresses);
+    for (const VarDecl& declaration : statement.declarations) {
+      for (const auto& dimension : declaration.dimensions)
+        collect_invariant_addresses(*dimension, excluded, addresses);
+      if (declaration.initializer)
+        collect_initializer_invariant_addresses(*declaration.initializer, excluded, addresses);
+    }
+    for (const auto& child : statement.statements)
+      collect_statement_invariant_addresses(*child, excluded, addresses);
+    if (statement.first)
+      collect_statement_invariant_addresses(*statement.first, excluded, addresses);
+    if (statement.second)
+      collect_statement_invariant_addresses(*statement.second, excluded, addresses);
+  }
+
+  bool is_unit_increment(const Expr& expression, const std::string& name) const {
+    if (expression.kind != ExprKind::Binary || expression.text != "+") return false;
+    auto is_name = [&](const Expr& value) {
+      return value.kind == ExprKind::Name && value.text == name;
+    };
+    auto is_one = [&](const Expr& value) {
+      auto constant = eval_const(value);
+      return constant && constant->base == BaseType::Int && constant->integer == 1;
+    };
+    return (is_name(*expression.left) && is_one(*expression.right)) ||
+           (is_one(*expression.left) && is_name(*expression.right));
+  }
+
+  void analyze_induction_updates(const Stmt& statement, const std::string& name,
+                                 std::size_t& assignments, std::size_t& increments,
+                                 bool& redeclared) const {
+    for (const VarDecl& declaration : statement.declarations)
+      redeclared |= declaration.name == name;
+    if (statement.kind == StmtKind::Assignment && statement.expression &&
+        statement.expression->kind == ExprKind::Name &&
+        statement.expression->text == name) {
+      ++assignments;
+      if (statement.value && is_unit_increment(*statement.value, name)) ++increments;
+    }
+    for (const auto& child : statement.statements)
+      analyze_induction_updates(*child, name, assignments, increments, redeclared);
+    if (statement.first)
+      analyze_induction_updates(*statement.first, name, assignments, increments, redeclared);
+    if (statement.second)
+      analyze_induction_updates(*statement.second, name, assignments, increments, redeclared);
+  }
+
+  std::optional<std::string> loop_unit_induction(const Stmt& statement) const {
+    const Expr& condition = *statement.expression;
+    if (condition.kind != ExprKind::Binary ||
+        (condition.text != "<" && condition.text != "<=" && condition.text != ">" &&
+         condition.text != ">=" && condition.text != "!="))
+      return std::nullopt;
+    const Expr* candidate = condition.left && condition.left->kind == ExprKind::Name
+                                ? condition.left.get()
+                                : condition.right && condition.right->kind == ExprKind::Name
+                                      ? condition.right.get()
+                                      : nullptr;
+    if (!candidate) return std::nullopt;
+    const Symbol* symbol = find_symbol(candidate->text);
+    if (!symbol || symbol->storage != Storage::IntRegister) return std::nullopt;
+    std::size_t assignments = 0;
+    std::size_t increments = 0;
+    bool redeclared = false;
+    analyze_induction_updates(*statement.first, candidate->text, assignments, increments,
+                              redeclared);
+    if (redeclared || assignments != 1 || increments != 1) return std::nullopt;
+    return candidate->text;
+  }
+
+  std::optional<Type> address_expression_type(const Expr& expression) const {
+    if (expression.kind == ExprKind::Name) {
+      for (auto it = inline_bindings_.rbegin(); it != inline_bindings_.rend(); ++it) {
+        auto binding = it->find(expression.text);
+        if (binding != it->end()) return binding->second.type;
+      }
+      const Symbol* symbol = find_symbol(expression.text);
+      return symbol ? std::optional<Type>{symbol->type} : std::nullopt;
+    }
+    if (expression.kind != ExprKind::Subscript || !expression.left) return std::nullopt;
+    auto base = address_expression_type(*expression.left);
+    if (!base || !base->is_array_like()) return std::nullopt;
+    std::vector<std::int64_t> remaining = base->dimensions;
+    if (!remaining.empty()) remaining.erase(remaining.begin());
+    return Type{base->base, std::move(remaining), !remaining.empty()};
+  }
+
+  std::optional<std::uint64_t> induction_address_advance(
+      const Expr& expression, const std::string& induction) const {
+    if (expression.kind != ExprKind::Subscript || !expression.left)
+      return std::uint64_t{0};
+    auto nested = induction_address_advance(*expression.left, induction);
+    auto base = address_expression_type(*expression.left);
+    if (!nested || !base || !base->is_array_like()) return std::nullopt;
+    std::uint64_t advance = *nested;
+    if (expression.right && expression.right->kind == ExprKind::Name &&
+        expression.right->text == induction) {
+      std::vector<std::int64_t> remaining = base->dimensions;
+      if (!remaining.empty()) remaining.erase(remaining.begin());
+      std::uint64_t stride = 4;
+      for (std::int64_t dimension : remaining) {
+        if (dimension <= 0 ||
+            stride > std::numeric_limits<std::uint64_t>::max() /
+                         static_cast<std::uint64_t>(dimension))
+          return std::nullopt;
+        stride *= static_cast<std::uint64_t>(dimension);
+      }
+      if (advance > std::numeric_limits<std::uint64_t>::max() - stride)
+        return std::nullopt;
+      advance += stride;
+    }
+    return advance;
+  }
+
+  void collect_induction_addresses(
+      const Expr& expression, const std::string& induction,
+      const std::unordered_set<std::string>& varying,
+      std::vector<std::pair<const Expr*, std::uint64_t>>& addresses) const {
+    if (addresses.size() >= 4) return;
+    auto advance = induction_address_advance(expression, induction);
+    if (expression.kind == ExprKind::Subscript && advance && *advance != 0 &&
+        !expression_uses_any_name(expression, varying)) {
+      const bool duplicate = std::any_of(
+          addresses.begin(), addresses.end(), [&](const auto& address) {
+            return expressions_equivalent(*address.first, expression);
+          });
+      if (!duplicate) addresses.push_back({&expression, *advance});
+      return;
+    }
+    for (const auto& argument : expression.args)
+      collect_induction_addresses(*argument, induction, varying, addresses);
+    if (expression.left)
+      collect_induction_addresses(*expression.left, induction, varying, addresses);
+    if (expression.right)
+      collect_induction_addresses(*expression.right, induction, varying, addresses);
+  }
+
+  void collect_statement_induction_addresses(const Stmt& statement,
+                                              const std::string& induction,
+                                              const std::unordered_set<std::string>& varying,
+                                              std::vector<std::pair<const Expr*,
+                                                                    std::uint64_t>>& addresses) const {
+    if (statement.kind == StmtKind::While) return;
+    if (statement.expression)
+      collect_induction_addresses(*statement.expression, induction, varying, addresses);
+    if (statement.value)
+      collect_induction_addresses(*statement.value, induction, varying, addresses);
+    for (const VarDecl& declaration : statement.declarations) {
+      for (const auto& dimension : declaration.dimensions)
+        collect_induction_addresses(*dimension, induction, varying, addresses);
+      if (declaration.initializer) {
+        std::vector<const Initializer*> pending{declaration.initializer.get()};
+        while (!pending.empty()) {
+          const Initializer* current = pending.back();
+          pending.pop_back();
+          if (current->expression)
+            collect_induction_addresses(*current->expression, induction, varying, addresses);
+          for (const auto& element : current->elements) pending.push_back(element.get());
+        }
+      }
+    }
+    for (const auto& child : statement.statements)
+      collect_statement_induction_addresses(*child, induction, varying, addresses);
+    if (statement.first)
+      collect_statement_induction_addresses(*statement.first, induction, varying, addresses);
+    if (statement.second)
+      collect_statement_induction_addresses(*statement.second, induction, varying, addresses);
+  }
+
+  void advance_loop_induction_addresses(const std::string& name) {
+    for (auto& frame : loop_address_bindings_) {
+      for (LoopAddressBinding& binding : frame) {
+        if (binding.induction_name != name || !binding.register_index) continue;
+        const std::string& reg = binding.address.label;
+        if (binding.advance_bytes <= 2047) {
+          line("addi " + reg + ", " + reg + ", " +
+               std::to_string(binding.advance_bytes));
+        } else {
+          line("li t2, " + std::to_string(binding.advance_bytes));
+          line("add " + reg + ", " + reg + ", t2");
+        }
+      }
+    }
+  }
+
   void emit_stmt(const Stmt& statement) {
     switch (statement.kind) {
       case StmtKind::Empty: return;
@@ -1916,6 +2335,16 @@ class Generator {
           store_to_current_address(type, value, statement.loc);
           return;
         }
+        if (options_.optimization == OptimizationLevel::O1 && !direct &&
+            statement.expression->kind == ExprKind::Subscript &&
+            !expression_contains_call(*statement.value)) {
+          Type type = address_to_register(*statement.expression);
+          line("mv t4, t0");
+          Value address = transient_pointer(std::move(type), "t4");
+          Value value = emit_expr(*statement.value);
+          store_to_address(address, value, statement.loc);
+          return;
+        }
         Value address = address_of(*statement.expression);
         Value value = emit_expr(*statement.value);
         store_to_address(address, value, statement.loc);
@@ -1946,13 +2375,64 @@ class Generator {
         const std::string test = new_label("while_test");
         const std::string body = new_label("while_body");
         const std::string done = new_label("while_done");
+        std::vector<LoopAddressBinding> address_bindings;
+        if (options_.optimization == OptimizationLevel::O1) {
+          std::unordered_set<std::string> excluded;
+          bool has_call = false;
+          collect_loop_excluded_names(*statement.first, excluded, has_call);
+          if (auto induction = loop_unit_induction(statement)) {
+            std::vector<std::pair<const Expr*, std::uint64_t>> induction_addresses;
+            std::unordered_set<std::string> varying = excluded;
+            varying.erase(*induction);
+            collect_statement_induction_addresses(*statement.first, *induction, varying,
+                                                  induction_addresses);
+            for (const auto& candidate : induction_addresses) {
+              const Expr* expression = candidate.first;
+              Type type = address_to_register(*expression);
+              std::optional<std::size_t> reg_index =
+                  acquire_loop_pointer_register(!has_call);
+              if (!reg_index) continue;
+              const std::string reg = loop_pointer_register_name(*reg_index);
+              line("mv " + reg + ", t0");
+              line("# sysy-loop-induction-address");
+              address_bindings.push_back(LoopAddressBinding{
+                  expression, transient_pointer(std::move(type), reg), reg_index,
+                  *induction, candidate.second});
+            }
+          }
+          if (!has_call) {
+            std::vector<const Expr*> invariant_addresses;
+            collect_statement_invariant_addresses(*statement.first, excluded,
+                                                  invariant_addresses);
+            for (const Expr* expression : invariant_addresses) {
+              Type type = address_to_register(*expression);
+              std::optional<std::size_t> reg_index = acquire_loop_pointer_register(true);
+              Value address;
+              if (reg_index) {
+                const std::string reg = loop_pointer_register_name(*reg_index);
+                line("mv " + reg + ", t0");
+                address = transient_pointer(std::move(type), reg);
+              } else {
+                address = make_pointer_temp(type, "t0");
+              }
+              line("# sysy-loop-address");
+              address_bindings.push_back(
+                  LoopAddressBinding{expression, std::move(address), reg_index, "", 0});
+            }
+          }
+        }
         line("j " + test);
         label(body);
+        loop_address_bindings_.push_back(std::move(address_bindings));
         break_labels_.push_back(done);
         continue_labels_.push_back(test);
         emit_stmt(*statement.first);
         continue_labels_.pop_back();
         break_labels_.pop_back();
+        for (const LoopAddressBinding& binding : loop_address_bindings_.back())
+          if (binding.register_index)
+            release_loop_pointer_register(*binding.register_index);
+        loop_address_bindings_.pop_back();
         label(test);
         emit_cond_branch_true(*statement.expression, body);
         label(done);
@@ -1977,6 +2457,7 @@ class Generator {
       if (statement.expression) fail(statement.loc, "void function cannot return a value");
     } else {
       if (!statement.expression) fail(statement.loc, "non-void function must return a value");
+      if (emit_self_tail_call(*statement.expression)) return;
       Value value = emit_expr(*statement.expression);
       if (current_return_.base == BaseType::Float)
         load_float(value, "fa0");
@@ -1984,6 +2465,27 @@ class Generator {
         load_int(value, "a0");
     }
     line("j " + epilogue_label_);
+  }
+
+  bool emit_self_tail_call(const Expr& expression) {
+    if (options_.optimization != OptimizationLevel::O1 ||
+        expression.kind != ExprKind::Call || expression.text != current_function_ ||
+        expression.args.size() != current_param_symbols_.size())
+      return false;
+    for (const Symbol* parameter : current_param_symbols_)
+      if (!parameter->type.is_scalar()) return false;
+
+    std::vector<Value> arguments;
+    arguments.reserve(expression.args.size());
+    for (const auto& argument : expression.args) {
+      Value value = emit_expr(*argument);
+      if (!value.type.is_scalar()) return false;
+      arguments.push_back(std::move(value));
+    }
+    for (std::size_t i = 0; i < arguments.size(); ++i)
+      store_to_symbol(*current_param_symbols_[i], arguments[i], expression.args[i]->loc);
+    line("j " + tail_entry_label_);
+    return true;
   }
 
   struct IncomingParam {
@@ -2014,8 +2516,9 @@ class Generator {
                             bool& has_call) const {
     if (expression.kind == ExprKind::Name) {
       auto global = globals_by_name_.find(expression.text);
-      if (global != globals_by_name_.end() && global->second.type.is_scalar() &&
-          !global->second.is_const)
+      if (global != globals_by_name_.end() &&
+          ((global->second.type.is_scalar() && !global->second.is_const) ||
+           global->second.type.is_array_like()))
         reads.insert(expression.text);
     } else if (expression.kind == ExprKind::Call) {
       auto definition = function_defs_.find(expression.text);
@@ -2063,24 +2566,40 @@ class Generator {
     std::unordered_set<std::string> reads;
     bool has_call = false;
     collect_statement_global_reads(*function.body, reads, has_call);
-    if (has_call) return;
-    for (const std::string& name : assigned_names_) {
-      auto global = globals_by_name_.find(name);
-      if (!declared.count(name) && global != globals_by_name_.end() &&
-          global->second.type.is_scalar() && !global->second.is_const) {
-        reads.insert(name);
-        global_writeback_names_.push_back(name);
+    const bool directly_recursive = statement_calls_function(*function.body, function.name);
+    if (!has_call) {
+      for (const std::string& name : assigned_names_) {
+        auto global = globals_by_name_.find(name);
+        if (!declared.count(name) && global != globals_by_name_.end() &&
+            global->second.type.is_scalar() && !global->second.is_const) {
+          reads.insert(name);
+          global_writeback_names_.push_back(name);
+        }
       }
     }
     std::sort(global_writeback_names_.begin(), global_writeback_names_.end());
     std::vector<std::string> ordered(reads.begin(), reads.end());
     std::sort(ordered.begin(), ordered.end());
+    std::stable_sort(ordered.begin(), ordered.end(), [&](const std::string& left,
+                                                         const std::string& right) {
+      return globals_by_name_.at(left).type.is_scalar() &&
+             globals_by_name_.at(right).type.is_array_like();
+    });
     for (const std::string& name : ordered) {
       if (declared.count(name)) continue;
       const Symbol& global = globals_by_name_.at(name);
+      if (directly_recursive && global.type.is_array_like()) continue;
       Symbol cached;
       cached.type = global.type;
       assign_scalar_register(cached, "");
+      if (global.type.is_array_like()) {
+        if (cached.storage == Storage::PointerRegister) {
+          line("lla " + cached.reg + ", " + global.label);
+          global_array_register_bindings_[name] = cached.reg;
+        }
+        continue;
+      }
+      if (has_call) continue;
       if (cached.storage == Storage::IntRegister) {
         load_int(local_value(global), cached.reg);
       } else if (cached.storage == Storage::FloatRegister) {
@@ -2143,6 +2662,7 @@ class Generator {
     current_function_loc_ = function.loc;
     current_return_ = Type{function.return_type, {}, false};
     epilogue_label_ = ".L" + function.name + "_epilogue";
+    tail_entry_label_ = ".L" + function.name + "_tail_entry";
     label_counter_ = 0;
     next_offset_ = 16;
     auto plan = register_plans_.find(function.name);
@@ -2159,8 +2679,12 @@ class Generator {
     next_float_register_ = 0;
     saved_int_registers_.fill(false);
     saved_float_registers_.fill(false);
+    active_loop_int_registers_.fill(false);
+    active_loop_caller_registers_.fill(false);
+    reusable_loop_int_registers_.clear();
     saved_registers_.clear();
     global_register_bindings_.clear();
+    global_array_register_bindings_.clear();
     global_writeback_names_.clear();
     assigned_names_.clear();
     collect_assigned_names(*function.body);
@@ -2177,7 +2701,8 @@ class Generator {
       Symbol symbol;
       symbol.type = resolve_param_type(param);
       symbol.storage = param.is_array ? Storage::ParamPointer : Storage::Local;
-      assign_scalar_register(symbol, param.name);
+      assign_scalar_register(
+          symbol, ir::source_register_key(param.name, param.loc.line, param.loc.column));
       if (symbol.storage == Storage::Local || symbol.storage == Storage::ParamPointer)
         symbol.offset = allocate(8);
       scopes_.back()[param.name] = symbol;
@@ -2189,8 +2714,10 @@ class Generator {
     std::vector<IncomingParam> incoming;
     for (std::size_t i = 0; i < param_symbols.size(); ++i)
       incoming.push_back(IncomingParam{param_symbols[i], param_types[i], placements[i]});
+    current_param_symbols_ = param_symbols;
 
     prepare_readonly_global_registers(function);
+    if (options_.optimization == OptimizationLevel::O1) label(tail_entry_label_);
     emit_stmt(*function.body);
     if (function.return_type == BaseType::Float)
       line("fmv.w.x fa0, zero");
@@ -2258,6 +2785,7 @@ class Generator {
   Loc current_function_loc_;
   Type current_return_;
   std::string epilogue_label_;
+  std::string tail_entry_label_;
   std::uint64_t next_offset_{16};
   std::uint64_t label_counter_{};
   std::vector<std::string> break_labels_;
@@ -2269,12 +2797,26 @@ class Generator {
   std::array<bool, 12> saved_float_registers_{};
   std::vector<SavedRegister> saved_registers_;
   std::vector<std::unordered_map<std::string, Value>> inline_bindings_;
+  std::vector<Symbol*> current_param_symbols_;
   std::unordered_map<std::string, Value> global_register_bindings_;
+  std::unordered_map<std::string, std::string> global_array_register_bindings_;
   std::vector<std::string> global_writeback_names_;
   std::unordered_map<std::string, ir::RegisterPlan> register_plans_;
   const ir::RegisterPlan* current_register_plan_{};
   std::unordered_set<std::size_t> planned_int_registers_;
   std::unordered_set<std::size_t> planned_float_registers_;
+  bool array_value_scratch_in_use_{};
+  struct LoopAddressBinding {
+    const Expr* expression{};
+    Value address;
+    std::optional<std::size_t> register_index;
+    std::string induction_name;
+    std::uint64_t advance_bytes{};
+  };
+  std::vector<std::vector<LoopAddressBinding>> loop_address_bindings_;
+  std::array<bool, 11> active_loop_int_registers_{};
+  std::array<bool, 4> active_loop_caller_registers_{};
+  std::set<std::size_t> reusable_loop_int_registers_;
 };
 
 }  // namespace
