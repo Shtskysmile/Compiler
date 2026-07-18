@@ -156,7 +156,14 @@ struct FunctionSig {
   bool variadic{};
 };
 
-enum class Storage { Local, Global, ParamPointer, IntRegister, FloatRegister };
+enum class Storage {
+  Local,
+  Global,
+  ParamPointer,
+  PointerRegister,
+  IntRegister,
+  FloatRegister
+};
 
 struct Symbol {
   Type type;
@@ -182,6 +189,7 @@ enum class ValueKind {
   Global,
   PointerSlot,
   String,
+  PointerRegister,
   IntRegister,
   FloatRegister
 };
@@ -648,6 +656,10 @@ class Generator {
     value.offset = symbol.offset;
     if (symbol.storage == Storage::ParamPointer)
       value.kind = ValueKind::PointerSlot;
+    else if (symbol.storage == Storage::PointerRegister) {
+      value.kind = ValueKind::PointerRegister;
+      value.label = symbol.reg;
+    }
     else if (symbol.storage == Storage::IntRegister) {
       value.kind = ValueKind::IntRegister;
       value.label = symbol.reg;
@@ -687,6 +699,8 @@ class Generator {
   void load_pointer(const Value& value, const std::string& reg) {
     if (value.kind == ValueKind::PointerSlot) {
       load_local("ld", reg, value.offset);
+    } else if (value.kind == ValueKind::PointerRegister) {
+      if (reg != value.label) line("mv " + reg + ", " + value.label);
     } else if (value.kind == ValueKind::String || value.kind == ValueKind::Global) {
       line("lla " + reg + ", " + value.label);
     } else {
@@ -771,6 +785,45 @@ class Generator {
     return transient_float("ft1");
   }
 
+  std::optional<unsigned> positive_power_of_two_shift(std::int32_t divisor) const {
+    if (options_.optimization != OptimizationLevel::O1 || divisor <= 0) return std::nullopt;
+    const std::uint32_t bits = static_cast<std::uint32_t>(divisor);
+    if ((bits & (bits - 1)) != 0) return std::nullopt;
+    unsigned shift = 0;
+    for (std::uint32_t value = bits; value > 1; value >>= 1) ++shift;
+    return shift;
+  }
+
+  void emit_signed_power_of_two_division(const std::string& op,
+                                         const std::string& destination,
+                                         const std::string& source,
+                                         unsigned shift) {
+    if (shift == 0) {
+      if (op == "%")
+        line("li " + destination + ", 0");
+      else if (destination != source)
+        line("mv " + destination + ", " + source);
+      return;
+    }
+
+    const std::uint32_t mask = (std::uint32_t{1} << shift) - 1;
+    line("sraiw t1, " + source + ", 31");
+    if (mask <= 2047) {
+      line("andi t1, t1, " + std::to_string(mask));
+    } else {
+      line("li t2, " + std::to_string(mask));
+      line("and t1, t1, t2");
+    }
+    line("addw t1, " + source + ", t1");
+    line("sraiw t1, t1, " + std::to_string(shift));
+    if (op == "/") {
+      if (destination != "t1") line("mv " + destination + ", t1");
+    } else {
+      line("slliw t1, t1, " + std::to_string(shift));
+      line("subw " + destination + ", " + source + ", t1");
+    }
+  }
+
   bool is_simple_index(const Expr& expression) const {
     if (expression.kind == ExprKind::Int || expression.kind == ExprKind::Float ||
         expression.kind == ExprKind::Name)
@@ -795,6 +848,8 @@ class Generator {
         line("lla t0, " + symbol->label);
       } else if (symbol->storage == Storage::ParamPointer) {
         load_local("ld", "t0", symbol->offset);
+      } else if (symbol->storage == Storage::PointerRegister) {
+        line("mv t0, " + symbol->reg);
       } else {
         address_from_s0(-static_cast<std::int64_t>(symbol->offset), "t0");
       }
@@ -999,6 +1054,14 @@ class Generator {
         if ((expression.text == "*" || expression.text == "/") && constant == 1)
           return left;
         if (expression.text == "*" && constant == 0) return immediate(make_int(0));
+        if (expression.text == "/" || expression.text == "%") {
+          auto shift = positive_power_of_two_shift(constant);
+          if (shift) {
+            load_int(left, "t0");
+            emit_signed_power_of_two_division(expression.text, "t0", "t0", *shift);
+            return finish_int_result("t0", transient_result);
+          }
+        }
         const std::int64_t delta = expression.text == "+"
                                        ? constant
                                        : expression.text == "-"
@@ -1625,8 +1688,21 @@ class Generator {
     Value right = emit_expr_transient(*expression.right);
     if (!right.type.is_scalar()) fail(expression.loc, "binary operator requires scalar operands");
     if (symbol.storage == Storage::IntRegister && right.type.base == BaseType::Int) {
+      auto constant = eval_const(*expression.right);
+      auto shift = constant && constant->base == BaseType::Int
+                       ? positive_power_of_two_shift(constant->integer)
+                       : std::nullopt;
+      if (shift && op == "*") {
+        if (*shift != 0)
+          line("slliw " + symbol.reg + ", " + symbol.reg + ", " +
+               std::to_string(*shift));
+        return true;
+      }
+      if (shift && op == "/") {
+        emit_signed_power_of_two_division(op, symbol.reg, symbol.reg, *shift);
+        return true;
+      }
       if (op == "+" || op == "-") {
-        auto constant = eval_const(*expression.right);
         if (constant && constant->base == BaseType::Int) {
           const std::int64_t delta = op == "+" ? constant->integer
                                                 : -static_cast<std::int64_t>(constant->integer);
@@ -1674,19 +1750,20 @@ class Generator {
   };
 
   void assign_scalar_register(Symbol& symbol, const std::string& name) {
-    if (options_.optimization != OptimizationLevel::O1 || !symbol.type.is_scalar() ||
-        symbol.is_const)
+    const bool pointer = symbol.type.is_array_like();
+    if (options_.optimization != OptimizationLevel::O1 ||
+        (!symbol.type.is_scalar() && !pointer) || symbol.is_const)
       return;
     std::optional<std::size_t> planned;
     if (current_register_plan_ && !name.empty()) {
-      const auto& category = symbol.type.base == BaseType::Float
+      const auto& category = !pointer && symbol.type.base == BaseType::Float
                                  ? current_register_plan_->floats
                                  : current_register_plan_->integers;
       auto found = category.find(name);
       if (found == category.end()) return;
       planned = found->second;
     }
-    if (symbol.type.base == BaseType::Int) {
+    if (pointer || symbol.type.base == BaseType::Int) {
       std::size_t index = planned.value_or(11);
       if (!planned) {
         for (std::size_t candidate = 0; candidate < 11; ++candidate)
@@ -1696,7 +1773,7 @@ class Generator {
           }
       }
       if (index >= 11) return;
-      symbol.storage = Storage::IntRegister;
+      symbol.storage = pointer ? Storage::PointerRegister : Storage::IntRegister;
       symbol.reg = "s" + std::to_string(index + 1);
       if (!saved_int_registers_[index]) {
         saved_int_registers_[index] = true;
@@ -1789,6 +1866,8 @@ class Generator {
       line("lla t0, " + symbol.label);
     else if (symbol.storage == Storage::ParamPointer)
       load_local("ld", "t0", symbol.offset);
+    else if (symbol.storage == Storage::PointerRegister)
+      line("mv t0, " + symbol.reg);
     else
       address_from_s0(-static_cast<std::int64_t>(symbol.offset), "t0");
     return make_pointer_temp(symbol.type, "t0");
@@ -2026,7 +2105,9 @@ class Generator {
           store_local("fsw", reg, incoming.symbol->offset);
       } else if (place.kind == ArgPlacement::Kind::Gpr) {
         const std::string reg = "a" + std::to_string(place.index);
-        if (incoming.symbol->storage == Storage::FloatRegister)
+        if (incoming.symbol->storage == Storage::PointerRegister)
+          line("mv " + incoming.symbol->reg + ", " + reg);
+        else if (incoming.symbol->storage == Storage::FloatRegister)
           line("fmv.w.x " + incoming.symbol->reg + ", " + reg);
         else if (incoming.symbol->storage == Storage::IntRegister)
           line("mv " + incoming.symbol->reg + ", " + reg);
@@ -2035,7 +2116,10 @@ class Generator {
       } else {
         if (incoming.type.is_array_like()) {
           load_base_offset("ld", "t0", "s0", place.stack_offset);
-          store_local("sd", "t0", incoming.symbol->offset);
+          if (incoming.symbol->storage == Storage::PointerRegister)
+            line("mv " + incoming.symbol->reg + ", t0");
+          else
+            store_local("sd", "t0", incoming.symbol->offset);
         } else if (incoming.type.base == BaseType::Float) {
           load_base_offset("flw", "ft0", "s0", place.stack_offset);
           if (incoming.symbol->storage == Storage::FloatRegister)

@@ -227,6 +227,45 @@ void test_o1_fuses_simple_array_addressing() {
   CHECK(!contains(result.assembly, "sd t0,"));
 }
 
+void test_o1_keeps_hot_pointer_parameters_in_registers() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int sum(int values[], int n) {
+      int i = 0;
+      int total = 0;
+      while (i < n) {
+        total = total + values[i];
+        i = i + 1;
+      }
+      return total;
+    }
+    int main(){return 0;}
+  )", "pointer-register.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "mv s4, a0"));
+  CHECK(contains(result.assembly, "mv t0, s4"));
+  CHECK(contains(result.assembly, "slli t1,"));
+  CHECK(!contains(result.assembly, "sd a0,"));
+}
+
+void test_o1_strength_reduces_signed_power_of_two_division() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int div2(int x) { return x / 2; }
+    int rem8(int x) { return x % 8; }
+    int scale(int x) { x = x * 8; return x; }
+    int main() { return div2(-7) * 10 + rem8(-19) + scale(3); }
+  )", "power-of-two-division.sy", options);
+  CHECK(result.ok);
+  CHECK(!contains(result.assembly, "divw"));
+  CHECK(!contains(result.assembly, "remw"));
+  CHECK(contains(result.assembly, "sraiw"));
+  CHECK(contains(result.assembly, "andi"));
+  CHECK(contains(result.assembly, "slliw s1, s1, 3"));
+}
+
 void test_branches_fall_through_to_true_blocks() {
   sysy::CompileOptions options;
   options.optimization = sysy::OptimizationLevel::O1;
@@ -452,6 +491,8 @@ int main() {
   test_source_limit();
   test_o1_keeps_scalars_in_callee_saved_registers();
   test_o1_fuses_simple_array_addressing();
+  test_o1_keeps_hot_pointer_parameters_in_registers();
+  test_o1_strength_reduces_signed_power_of_two_division();
   test_branches_fall_through_to_true_blocks();
   test_o1_forwards_immediately_consumed_temporaries();
   test_o1_inlines_small_leaf_functions_once();

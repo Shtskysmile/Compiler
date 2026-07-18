@@ -334,8 +334,12 @@ class SourceRegisterPlanner {
   }
 
   RegisterPlan run() {
-    for (const ParamDecl& param : source_.params)
-      if (!param.is_array) declare(param.name, param.base);
+    for (const ParamDecl& param : source_.params) {
+      if (param.is_array)
+        pointer_parameters_.insert(param.name);
+      else
+        declare(param.name, param.base);
+    }
     walk_statement(*source_.body);
     propagate_constants_and_copies(function_);
     simplify_algebra(function_);
@@ -353,6 +357,17 @@ class SourceRegisterPlanner {
         plan.integers[variable.name] = allocation->second.index;
       else if (allocation->second.kind == Allocation::Kind::FloatRegister)
         plan.floats[variable.name] = allocation->second.index;
+    }
+    std::set<std::size_t> used_integer_registers;
+    for (const auto& item : plan.integers) used_integer_registers.insert(item.second);
+    for (const ParamDecl& param : source_.params) {
+      if (has_nonlocal_name_) break;
+      if (!param.is_array) continue;
+      std::size_t reg = 0;
+      while (reg < integer_registers_ && used_integer_registers.count(reg)) ++reg;
+      if (reg == integer_registers_) break;
+      plan.integers[param.name] = reg;
+      used_integer_registers.insert(reg);
     }
     return plan;
   }
@@ -389,7 +404,10 @@ class SourceRegisterPlanner {
 
   void use(const std::string& name) {
     const ValueId value = find(name);
-    if (!value) return;
+    if (!value) {
+      if (!pointer_parameters_.count(name)) has_nonlocal_name_ = true;
+      return;
+    }
     for (auto& loop : active_loop_uses_) loop.insert(value);
     use(value);
   }
@@ -466,6 +484,8 @@ class SourceRegisterPlanner {
   std::unordered_map<ValueId, Variable> variables_;
   std::unordered_map<std::string, std::size_t> name_counts_;
   std::vector<std::unordered_set<ValueId>> active_loop_uses_;
+  std::unordered_set<std::string> pointer_parameters_;
+  bool has_nonlocal_name_{};
 };
 
 }  // namespace
