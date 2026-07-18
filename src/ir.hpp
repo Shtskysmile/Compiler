@@ -6,6 +6,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sysy::detail {
+struct Program;
+}
+
 namespace sysy::detail::ir {
 
 using ValueId = std::uint32_t;
@@ -76,5 +80,13 @@ struct Allocation {
 
 std::unordered_map<ValueId, Allocation> linear_scan_allocate(
     const Function& function, std::size_t integer_registers, std::size_t float_registers);
+
+struct RegisterPlan {
+  std::unordered_map<std::string, std::size_t> integers;
+  std::unordered_map<std::string, std::size_t> floats;
+};
+
+std::unordered_map<std::string, RegisterPlan> plan_source_registers(
+    const Program& program, std::size_t integer_registers, std::size_t float_registers);
 
 }  // namespace sysy::detail::ir

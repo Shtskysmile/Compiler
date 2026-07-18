@@ -58,6 +58,8 @@ void test_minimal_program() {
   CHECK(contains(result.assembly, "main:"));
   CHECK(contains(result.assembly, "li a0, 3"));
   CHECK(contains(result.assembly, "ret"));
+  CHECK(!contains(result.assembly, "sd ra,"));
+  CHECK(!contains(result.assembly, "ld ra,"));
 }
 
 void test_integer_control_flow_and_short_circuit() {
@@ -128,6 +130,13 @@ void test_o1_is_general_and_valid() {
       "int main(){int a=2*3; int dead=9; return a+0;}", "o1.sy", options);
   CHECK(result.ok);
   CHECK(contains(result.assembly, "li a0, 6"));
+
+  auto immediates = sysy::compile_source(
+      "int add5(int x){return x+5;} int mul8(int x){return x*8;} int main(){return 0;}",
+      "immediates.sy", options);
+  CHECK(immediates.ok);
+  CHECK(contains(immediates.assembly, "addiw t0, t0, 5"));
+  CHECK(contains(immediates.assembly, "slliw t0, t0, 3"));
 }
 
 void expect_error(const char* source) {
@@ -199,7 +208,7 @@ void test_o1_keeps_scalars_in_callee_saved_registers() {
   CHECK(contains(result.assembly, "fsd fs0,"));
   CHECK(contains(result.assembly, "mv s1, a0"));
   CHECK(contains(result.assembly, "fmv.s fs0, fa0"));
-  CHECK(contains(result.assembly, "fmv.w.x fs8, a0"));
+  CHECK(contains(result.assembly, "fmv.w.x fs0, a0"));
   CHECK(contains(result.assembly, "addiw s2, s2, 1"));
   CHECK(contains(result.assembly, "fadd.s fs1, fs1, ft0"));
   CHECK(contains(result.assembly, "ld s1,"));
@@ -219,13 +228,18 @@ void test_o1_fuses_simple_array_addressing() {
 }
 
 void test_branches_fall_through_to_true_blocks() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
   auto result = sysy::compile_source(
       "int main(){int i=0; while(i<3)i=i+1; if(i>1)return i; return 0;}",
-      "fallthrough.sy");
+      "fallthrough.sy", options);
   CHECK(result.ok);
   CHECK(!contains(result.assembly, "j .Lmain_while_body"));
-  CHECK(!contains(result.assembly, "j .Lmain_if_true"));
+  CHECK(contains(result.assembly, "j .Lmain_while_test"));
+  CHECK(!contains(result.assembly, "j .Lmain_while_head"));
   CHECK(!contains(result.assembly, "mv t1, t0\n  mv t0, t1"));
+  CHECK(!contains(result.assembly, "slt t0"));
+  CHECK(contains(result.assembly, "slti t0, s1, 3"));
 }
 
 void test_o1_forwards_immediately_consumed_temporaries() {
@@ -273,7 +287,7 @@ void test_o1_hoists_readonly_globals_without_calls() {
   auto result = sysy::compile_source(source, "licm.sy", options);
   CHECK(result.ok);
   CHECK(contains(result.assembly, "lw s2, 0(t6)"));
-  CHECK(contains(result.assembly, "mv t1, s2"));
+  CHECK(contains(result.assembly, "blt s1, s2"));
 
   auto mutable_result = sysy::compile_source(R"(
     int state;
@@ -384,6 +398,47 @@ void test_typed_ir_edge_paths() {
   CHECK(allocation.blocks[0].instructions.size() == 3);
 }
 
+void test_ir_linear_scan_drives_backend_registers() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int pick(int p0,int p1,int p2,int p3,int p4,int p5,
+             int p6,int p7,int p8,int p9,int p10,int hot) { return hot; }
+    int main(){return 0;}
+  )", "ir-register-plan.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "lw t0, 24(s0)\n  mv s1, t0"));
+  CHECK(!contains(result.assembly, "mv s11, a"));
+
+  auto loop = sysy::compile_source(R"(
+    int repeat(int n) {
+      int i = 0;
+      while (i < n) {
+        int tmp = i;
+        putint(tmp);
+        i = i + 1;
+      }
+      return 0;
+    }
+    int main(){return 0;}
+  )", "ir-loop-liveness.sy", options);
+  CHECK(loop.ok);
+  CHECK(contains(loop.assembly, "blt s2, s1"));
+  CHECK(contains(loop.assembly, "mv s3, s2"));
+  CHECK(!contains(loop.assembly, "mv s1, s2"));
+}
+
+void test_deep_expression_does_not_overflow_host_stack() {
+  std::string source = "int a[1]; int main(){int answer=a[0]";
+  for (int i = 1; i < 4096; ++i) source += "+a[0]";
+  source += ";return answer;}";
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(source, "deep-expression.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "addw"));
+}
+
 }  // namespace
 
 int main() {
@@ -403,6 +458,8 @@ int main() {
   test_o1_hoists_readonly_globals_without_calls();
   test_typed_ir_optimizations_and_linear_scan();
   test_typed_ir_edge_paths();
+  test_ir_linear_scan_drives_backend_registers();
+  test_deep_expression_does_not_overflow_host_stack();
   if (failures != 0) {
     std::cerr << failures << " test checks failed\n";
     return EXIT_FAILURE;

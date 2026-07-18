@@ -1,4 +1,5 @@
 #include "ir.hpp"
+#include "internal.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -316,6 +317,166 @@ std::unordered_map<ValueId, Allocation> linear_scan_allocate(
     }
   }
   return result;
+}
+
+namespace {
+
+class SourceRegisterPlanner {
+ public:
+  SourceRegisterPlanner(const sysy::detail::Function& source, std::size_t integer_registers,
+                        std::size_t float_registers)
+      : source_(source), integer_registers_(integer_registers),
+        float_registers_(float_registers) {
+    function_.name = source.name;
+    function_.entry = 0;
+    function_.blocks.push_back(Block{0, {}, {}});
+    scopes_.emplace_back();
+  }
+
+  RegisterPlan run() {
+    for (const ParamDecl& param : source_.params)
+      if (!param.is_array) declare(param.name, param.base);
+    walk_statement(*source_.body);
+    propagate_constants_and_copies(function_);
+    simplify_algebra(function_);
+    eliminate_local_common_subexpressions(function_);
+    eliminate_dead_code(function_);
+    auto allocations =
+        linear_scan_allocate(function_, integer_registers_, float_registers_);
+    RegisterPlan plan;
+    for (const auto& item : variables_) {
+      const Variable& variable = item.second;
+      if (variable.uses == 0 || name_counts_[variable.name] != 1) continue;
+      auto allocation = allocations.find(variable.value);
+      if (allocation == allocations.end()) continue;
+      if (allocation->second.kind == Allocation::Kind::IntegerRegister)
+        plan.integers[variable.name] = allocation->second.index;
+      else if (allocation->second.kind == Allocation::Kind::FloatRegister)
+        plan.floats[variable.name] = allocation->second.index;
+    }
+    return plan;
+  }
+
+ private:
+  struct Variable {
+    std::string name;
+    ValueId value{};
+    Type type{Type::I32};
+    std::size_t uses{};
+  };
+
+  void declare(const std::string& name, BaseType base) {
+    const ValueId value = next_value_++;
+    const Type type = base == BaseType::Float ? Type::F32 : Type::I32;
+    scopes_.back()[name] = value;
+    variables_[value] = Variable{name, value, type, 0};
+    ++name_counts_[name];
+    Instruction definition;
+    definition.opcode = Opcode::Address;
+    definition.type = type;
+    definition.result = value;
+    definition.symbol = name;
+    block().instructions.push_back(std::move(definition));
+  }
+
+  ValueId find(const std::string& name) const {
+    for (auto scope = scopes_.rbegin(); scope != scopes_.rend(); ++scope) {
+      auto found = scope->find(name);
+      if (found != scope->end()) return found->second;
+    }
+    return 0;
+  }
+
+  void use(const std::string& name) {
+    const ValueId value = find(name);
+    if (!value) return;
+    for (auto& loop : active_loop_uses_) loop.insert(value);
+    use(value);
+  }
+
+  void use(ValueId value) {
+    ++variables_.at(value).uses;
+    Instruction use;
+    use.opcode = Opcode::Store;
+    use.type = Type::Void;
+    use.operands = {value};
+    use.symbol = variables_.at(value).name;
+    block().instructions.push_back(std::move(use));
+  }
+
+  void walk_expression(const Expr& expression) {
+    std::vector<const Expr*> pending{&expression};
+    while (!pending.empty()) {
+      const Expr* current = pending.back();
+      pending.pop_back();
+      if (current->kind == ExprKind::Name) use(current->text);
+      for (auto argument = current->args.rbegin(); argument != current->args.rend(); ++argument)
+        pending.push_back(argument->get());
+      if (current->right) pending.push_back(current->right.get());
+      if (current->left) pending.push_back(current->left.get());
+    }
+  }
+
+  void walk_initializer(const Initializer& initializer) {
+    if (initializer.expression) walk_expression(*initializer.expression);
+    for (const auto& element : initializer.elements) walk_initializer(*element);
+  }
+
+  void walk_statement(const Stmt& statement) {
+    if (statement.kind == StmtKind::While) {
+      active_loop_uses_.emplace_back();
+      walk_expression(*statement.expression);
+      walk_statement(*statement.first);
+      std::vector<ValueId> loop_uses(active_loop_uses_.back().begin(),
+                                     active_loop_uses_.back().end());
+      active_loop_uses_.pop_back();
+      std::sort(loop_uses.begin(), loop_uses.end());
+      for (ValueId value : loop_uses) {
+        for (auto& outer_loop : active_loop_uses_) outer_loop.insert(value);
+        use(value);
+      }
+      return;
+    }
+    const bool block_scope = statement.kind == StmtKind::Block;
+    if (block_scope) scopes_.emplace_back();
+    if (statement.kind == StmtKind::Declaration) {
+      for (const VarDecl& declaration : statement.declarations) {
+        for (const auto& dimension : declaration.dimensions) walk_expression(*dimension);
+        if (declaration.dimensions.empty()) declare(declaration.name, declaration.base);
+        if (declaration.initializer) walk_initializer(*declaration.initializer);
+      }
+    } else {
+      if (statement.expression) walk_expression(*statement.expression);
+      if (statement.value) walk_expression(*statement.value);
+    }
+    for (const auto& child : statement.statements) walk_statement(*child);
+    if (statement.first) walk_statement(*statement.first);
+    if (statement.second) walk_statement(*statement.second);
+    if (block_scope) scopes_.pop_back();
+  }
+
+  Block& block() { return function_.blocks.front(); }
+
+  const sysy::detail::Function& source_;
+  std::size_t integer_registers_{};
+  std::size_t float_registers_{};
+  Function function_;
+  ValueId next_value_{1};
+  std::vector<std::unordered_map<std::string, ValueId>> scopes_;
+  std::unordered_map<ValueId, Variable> variables_;
+  std::unordered_map<std::string, std::size_t> name_counts_;
+  std::vector<std::unordered_set<ValueId>> active_loop_uses_;
+};
+
+}  // namespace
+
+std::unordered_map<std::string, RegisterPlan> plan_source_registers(
+    const Program& program, std::size_t integer_registers, std::size_t float_registers) {
+  std::unordered_map<std::string, RegisterPlan> plans;
+  for (const sysy::detail::Function& function : program.functions)
+    plans[function.name] =
+        SourceRegisterPlanner(function, integer_registers, float_registers).run();
+  return plans;
 }
 
 }  // namespace sysy::detail::ir

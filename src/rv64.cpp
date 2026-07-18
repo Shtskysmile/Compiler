@@ -1,4 +1,5 @@
 #include "internal.hpp"
+#include "ir.hpp"
 
 #include <algorithm>
 #include <array>
@@ -199,6 +200,8 @@ class Generator {
   Generator(const Program& program, const CompileOptions& options)
       : program_(program), options_(options) {
     install_builtins();
+    if (options_.optimization == OptimizationLevel::O1)
+      register_plans_ = ir::plan_source_registers(program_, 11, 12);
   }
 
   std::string run() {
@@ -239,88 +242,121 @@ class Generator {
   }
 
   std::optional<Constant> eval_const(const Expr& expression) const {
-    switch (expression.kind) {
-      case ExprKind::Int: return make_int(expression.int_value);
-      case ExprKind::Float: return make_float(expression.float_value);
-      case ExprKind::Name: {
-        const Symbol* symbol = find_symbol(expression.text);
-        if (symbol && symbol->constant) return symbol->constant;
-        return std::nullopt;
+    struct Frame {
+      const Expr* expression{};
+      bool expanded{};
+    };
+    std::vector<Frame> pending{{&expression, false}};
+    std::unordered_map<const Expr*, std::optional<Constant>> values;
+    while (!pending.empty()) {
+      const Frame frame = pending.back();
+      pending.pop_back();
+      const Expr& current = *frame.expression;
+      if (!frame.expanded) {
+        if (current.kind == ExprKind::Int) {
+          values[&current] = make_int(current.int_value);
+        } else if (current.kind == ExprKind::Float) {
+          values[&current] = make_float(current.float_value);
+        } else if (current.kind == ExprKind::Name) {
+          const Symbol* symbol = find_symbol(current.text);
+          values[&current] = symbol && symbol->constant ? symbol->constant : std::nullopt;
+        } else if (current.kind == ExprKind::Unary) {
+          pending.push_back({&current, true});
+          pending.push_back({current.left.get(), false});
+        } else if (current.kind == ExprKind::Binary) {
+          pending.push_back({&current, true});
+          pending.push_back({current.right.get(), false});
+          pending.push_back({current.left.get(), false});
+        } else {
+          values[&current] = std::nullopt;
+        }
+        continue;
       }
-      case ExprKind::Unary: {
-        auto inner = eval_const(*expression.left);
-        if (!inner) return std::nullopt;
-        if (expression.text == "+") return inner;
-        if (expression.text == "!") return make_int(!truthy(*inner));
-        if (inner->base == BaseType::Float) return make_float(-inner->floating);
-        return make_int(wrap_sub(0, inner->integer));
+
+      if (current.kind == ExprKind::Unary) {
+        const auto& inner = values.at(current.left.get());
+        if (!inner) {
+          values[&current] = std::nullopt;
+        } else if (current.text == "+") {
+          values[&current] = inner;
+        } else if (current.text == "!") {
+          values[&current] = make_int(!truthy(*inner));
+        } else if (inner->base == BaseType::Float) {
+          values[&current] = make_float(-inner->floating);
+        } else {
+          values[&current] = make_int(wrap_sub(0, inner->integer));
+        }
+        continue;
       }
-      case ExprKind::Binary: {
-        if (expression.text == "&&") {
-          auto left = eval_const(*expression.left);
-          if (!left) return std::nullopt;
-          if (!truthy(*left)) return make_int(0);
-          auto right = eval_const(*expression.right);
-          return right ? std::optional<Constant>(make_int(truthy(*right))) : std::nullopt;
-        }
-        if (expression.text == "||") {
-          auto left = eval_const(*expression.left);
-          if (!left) return std::nullopt;
-          if (truthy(*left)) return make_int(1);
-          auto right = eval_const(*expression.right);
-          return right ? std::optional<Constant>(make_int(truthy(*right))) : std::nullopt;
-        }
-        auto left = eval_const(*expression.left);
-        auto right = eval_const(*expression.right);
-        if (!left || !right) return std::nullopt;
-        const bool use_float = left->base == BaseType::Float || right->base == BaseType::Float;
-        if (expression.text == "+")
-          return use_float ? make_float(as_float(*left) + as_float(*right))
-                           : make_int(wrap_add(left->integer, right->integer));
-        if (expression.text == "-")
-          return use_float ? make_float(as_float(*left) - as_float(*right))
-                           : make_int(wrap_sub(left->integer, right->integer));
-        if (expression.text == "*")
-          return use_float ? make_float(as_float(*left) * as_float(*right))
-                           : make_int(wrap_mul(left->integer, right->integer));
-        if (expression.text == "/") {
-          if ((use_float && as_float(*right) == 0.0F) || (!use_float && right->integer == 0))
-            return std::nullopt;
-          if (use_float) return make_float(as_float(*left) / as_float(*right));
-          if (left->integer == std::numeric_limits<std::int32_t>::min() &&
-              right->integer == -1)
-            return make_int(left->integer);
-          return make_int(left->integer / right->integer);
-        }
-        if (expression.text == "%") {
-          if (use_float || right->integer == 0) return std::nullopt;
-          if (left->integer == std::numeric_limits<std::int32_t>::min() &&
-              right->integer == -1)
-            return make_int(0);
-          return make_int(left->integer % right->integer);
-        }
-        if (expression.text == "==")
-          return make_int(use_float ? as_float(*left) == as_float(*right)
-                                    : left->integer == right->integer);
-        if (expression.text == "!=")
-          return make_int(use_float ? as_float(*left) != as_float(*right)
-                                    : left->integer != right->integer);
-        if (expression.text == "<")
-          return make_int(use_float ? as_float(*left) < as_float(*right)
-                                    : left->integer < right->integer);
-        if (expression.text == "<=")
-          return make_int(use_float ? as_float(*left) <= as_float(*right)
-                                    : left->integer <= right->integer);
-        if (expression.text == ">")
-          return make_int(use_float ? as_float(*left) > as_float(*right)
-                                    : left->integer > right->integer);
-        if (expression.text == ">=")
-          return make_int(use_float ? as_float(*left) >= as_float(*right)
-                                    : left->integer >= right->integer);
-        return std::nullopt;
+
+      const auto& left = values.at(current.left.get());
+      const auto& right = values.at(current.right.get());
+      if (current.text == "&&" && left && !truthy(*left)) {
+        values[&current] = make_int(0);
+        continue;
       }
-      default: return std::nullopt;
+      if (current.text == "||" && left && truthy(*left)) {
+        values[&current] = make_int(1);
+        continue;
+      }
+      if (!left || !right) {
+        values[&current] = std::nullopt;
+        continue;
+      }
+      if (current.text == "&&" || current.text == "||") {
+        values[&current] = make_int(truthy(*right));
+        continue;
+      }
+      const bool use_float = left->base == BaseType::Float || right->base == BaseType::Float;
+      if (current.text == "+")
+        values[&current] = use_float ? make_float(as_float(*left) + as_float(*right))
+                                     : make_int(wrap_add(left->integer, right->integer));
+      else if (current.text == "-")
+        values[&current] = use_float ? make_float(as_float(*left) - as_float(*right))
+                                     : make_int(wrap_sub(left->integer, right->integer));
+      else if (current.text == "*")
+        values[&current] = use_float ? make_float(as_float(*left) * as_float(*right))
+                                     : make_int(wrap_mul(left->integer, right->integer));
+      else if (current.text == "/") {
+        if ((use_float && as_float(*right) == 0.0F) || (!use_float && right->integer == 0))
+          values[&current] = std::nullopt;
+        else if (use_float)
+          values[&current] = make_float(as_float(*left) / as_float(*right));
+        else if (left->integer == std::numeric_limits<std::int32_t>::min() &&
+                 right->integer == -1)
+          values[&current] = make_int(left->integer);
+        else
+          values[&current] = make_int(left->integer / right->integer);
+      } else if (current.text == "%") {
+        if (use_float || right->integer == 0)
+          values[&current] = std::nullopt;
+        else if (left->integer == std::numeric_limits<std::int32_t>::min() &&
+                 right->integer == -1)
+          values[&current] = make_int(0);
+        else
+          values[&current] = make_int(left->integer % right->integer);
+      } else if (current.text == "==")
+        values[&current] = make_int(use_float ? as_float(*left) == as_float(*right)
+                                              : left->integer == right->integer);
+      else if (current.text == "!=")
+        values[&current] = make_int(use_float ? as_float(*left) != as_float(*right)
+                                              : left->integer != right->integer);
+      else if (current.text == "<")
+        values[&current] = make_int(use_float ? as_float(*left) < as_float(*right)
+                                              : left->integer < right->integer);
+      else if (current.text == "<=")
+        values[&current] = make_int(use_float ? as_float(*left) <= as_float(*right)
+                                              : left->integer <= right->integer);
+      else if (current.text == ">")
+        values[&current] = make_int(use_float ? as_float(*left) > as_float(*right)
+                                              : left->integer > right->integer);
+      else if (current.text == ">=")
+        values[&current] = make_int(use_float ? as_float(*left) >= as_float(*right)
+                                              : left->integer >= right->integer);
+      else
+        values[&current] = std::nullopt;
     }
+    return values.at(&expression);
   }
 
   const Symbol* find_symbol(const std::string& name) const {
@@ -909,8 +945,23 @@ class Generator {
   Value emit_binary(const Expr& expression, bool transient_result) {
     if (expression.text == "&&" || expression.text == "||")
       return materialize_bool(expression);
-    Value left = emit_expr(*expression.left);
-    Value right = emit_expr_transient(*expression.right);
+    std::vector<const Expr*> left_spine;
+    const Expr* first = &expression;
+    while (first->kind == ExprKind::Binary && first->text != "&&" && first->text != "||") {
+      left_spine.push_back(first);
+      first = first->left.get();
+    }
+    Value result = emit_expr(*first);
+    for (auto node = left_spine.rbegin(); node != left_spine.rend(); ++node) {
+      Value right = emit_expr_transient(*(*node)->right);
+      const bool final = std::next(node) == left_spine.rend();
+      result = emit_binary_values(**node, result, right, final && transient_result);
+    }
+    return result;
+  }
+
+  Value emit_binary_values(const Expr& expression, Value left, Value right,
+                           bool transient_result) {
     if (!left.type.is_scalar() || !right.type.is_scalar())
       fail(expression.loc, "binary operator requires scalar operands");
     const bool comparison = expression.text == "==" || expression.text == "!=" ||
@@ -939,6 +990,41 @@ class Generator {
       else if (expression.text == "/") line("fdiv.s ft0, ft0, ft1");
       else fail(expression.loc, "unsupported floating operator");
       return finish_float_result("ft0", transient_result);
+    }
+    if (!comparison) {
+      if (right.kind == ValueKind::ImmediateInt) {
+        const std::int32_t constant = right.integer;
+        if ((expression.text == "+" || expression.text == "-") && constant == 0)
+          return left;
+        if ((expression.text == "*" || expression.text == "/") && constant == 1)
+          return left;
+        if (expression.text == "*" && constant == 0) return immediate(make_int(0));
+        const std::int64_t delta = expression.text == "+"
+                                       ? constant
+                                       : expression.text == "-"
+                                             ? -static_cast<std::int64_t>(constant)
+                                             : 4096;
+        if ((expression.text == "+" || expression.text == "-") && delta >= -2048 &&
+            delta <= 2047) {
+          load_int(left, "t0");
+          line("addiw t0, t0, " + std::to_string(delta));
+          return finish_int_result("t0", transient_result);
+        }
+        const std::uint32_t bits = static_cast<std::uint32_t>(constant);
+        if (expression.text == "*" && constant > 0 && (bits & (bits - 1)) == 0) {
+          unsigned shift = 0;
+          for (std::uint32_t value = bits; value > 1; value >>= 1) ++shift;
+          load_int(left, "t0");
+          line("slliw t0, t0, " + std::to_string(shift));
+          return finish_int_result("t0", transient_result);
+        }
+      }
+      if (left.kind == ValueKind::ImmediateInt) {
+        if (expression.text == "+" && left.integer == 0) return right;
+        if (expression.text == "*" && left.integer == 0) return immediate(make_int(0));
+        if (expression.text == "*" && left.integer == 1) return right;
+        if (expression.text == "+" || expression.text == "*") std::swap(left, right);
+      }
     }
     load_int(left, "t0");
     load_int(right, "t1");
@@ -969,6 +1055,87 @@ class Generator {
     return finish_int_result("t0", transient_result);
   }
 
+  bool emit_comparison_branch_false(const Expr& expression,
+                                    const std::string& false_label) {
+    if (expression.kind != ExprKind::Binary ||
+        (expression.text != "==" && expression.text != "!=" && expression.text != "<" &&
+         expression.text != "<=" && expression.text != ">" && expression.text != ">="))
+      return false;
+    Value left = emit_expr(*expression.left);
+    Value right = emit_expr_transient(*expression.right);
+    if (!left.type.is_scalar() || !right.type.is_scalar())
+      fail(expression.loc, "binary operator requires scalar operands");
+    const bool use_float = left.type.base == BaseType::Float || right.type.base == BaseType::Float;
+    if (use_float) {
+      const std::string left_reg =
+          left.type.base == BaseType::Float && left.kind == ValueKind::FloatRegister
+              ? left.label
+              : "ft0";
+      const std::string right_reg =
+          right.type.base == BaseType::Float && right.kind == ValueKind::FloatRegister
+              ? right.label
+              : "ft1";
+      if (left_reg == "ft0") load_float(left, left_reg);
+      if (right_reg == "ft1") load_float(right, right_reg);
+      if (expression.text == "==") {
+        line("feq.s t0, " + left_reg + ", " + right_reg);
+        line("beqz t0, " + false_label);
+      } else if (expression.text == "!=") {
+        line("feq.s t0, " + left_reg + ", " + right_reg);
+        line("bnez t0, " + false_label);
+      } else if (expression.text == "<") {
+        line("flt.s t0, " + left_reg + ", " + right_reg);
+        line("beqz t0, " + false_label);
+      } else if (expression.text == "<=") {
+        line("fle.s t0, " + left_reg + ", " + right_reg);
+        line("beqz t0, " + false_label);
+      } else if (expression.text == ">") {
+        line("flt.s t0, " + right_reg + ", " + left_reg);
+        line("beqz t0, " + false_label);
+      } else {
+        line("fle.s t0, " + right_reg + ", " + left_reg);
+        line("beqz t0, " + false_label);
+      }
+      return true;
+    }
+    if (left.kind == ValueKind::IntRegister && right.kind == ValueKind::ImmediateInt) {
+      const std::int64_t constant = right.integer;
+      if (expression.text == "==" && constant == 0) {
+        line("bnez " + left.label + ", " + false_label);
+        return true;
+      }
+      if (expression.text == "!=" && constant == 0) {
+        line("beqz " + left.label + ", " + false_label);
+        return true;
+      }
+      const bool inclusive = expression.text == "<=" || expression.text == ">";
+      const std::int64_t threshold = constant + (inclusive ? 1 : 0);
+      if ((expression.text == "<" || expression.text == "<=" || expression.text == ">" ||
+           expression.text == ">=") &&
+          threshold >= -2048 && threshold <= 2047) {
+        line("slti t0, " + left.label + ", " + std::to_string(threshold));
+        const bool false_when_less = expression.text == ">" || expression.text == ">=";
+        line(std::string(false_when_less ? "bnez t0, " : "beqz t0, ") + false_label);
+        return true;
+      }
+    }
+    const std::string left_reg =
+        left.kind == ValueKind::IntRegister ? left.label : "t0";
+    const std::string right_reg =
+        right.kind == ValueKind::IntRegister ? right.label : "t1";
+    if (left_reg == "t0") load_int(left, left_reg);
+    if (right_reg == "t1") load_int(right, right_reg);
+    const std::string instruction =
+        expression.text == "=="   ? "bne"
+        : expression.text == "!=" ? "beq"
+        : expression.text == "<"  ? "bge"
+        : expression.text == "<=" ? "bgt"
+        : expression.text == ">"  ? "ble"
+                                    : "blt";
+    line(instruction + " " + left_reg + ", " + right_reg + ", " + false_label);
+    return true;
+  }
+
   void emit_cond(const Expr& expression, const std::string& true_label,
                  const std::string& false_label) {
     if (expression.kind == ExprKind::Binary && expression.text == "&&") {
@@ -987,6 +1154,10 @@ class Generator {
     }
     if (expression.kind == ExprKind::Unary && expression.text == "!") {
       emit_cond(*expression.left, false_label, true_label);
+      return;
+    }
+    if (emit_comparison_branch_false(expression, false_label)) {
+      line("j " + true_label);
       return;
     }
     Value value = emit_expr(expression);
@@ -1024,6 +1195,7 @@ class Generator {
       label(pass);
       return;
     }
+    if (emit_comparison_branch_false(expression, false_label)) return;
     Value value = emit_expr(expression);
     if (!value.type.is_scalar()) fail(expression.loc, "condition must be scalar");
     if (value.type.base == BaseType::Float) {
@@ -1034,6 +1206,116 @@ class Generator {
     } else {
       load_int(value, "t0");
       line("beqz t0, " + false_label);
+    }
+  }
+
+  bool emit_comparison_branch_true(const Expr& expression,
+                                   const std::string& true_label) {
+    if (expression.kind != ExprKind::Binary ||
+        (expression.text != "==" && expression.text != "!=" && expression.text != "<" &&
+         expression.text != "<=" && expression.text != ">" && expression.text != ">="))
+      return false;
+    Value left = emit_expr(*expression.left);
+    Value right = emit_expr_transient(*expression.right);
+    if (!left.type.is_scalar() || !right.type.is_scalar())
+      fail(expression.loc, "binary operator requires scalar operands");
+    const bool use_float = left.type.base == BaseType::Float || right.type.base == BaseType::Float;
+    if (use_float) {
+      const std::string left_reg =
+          left.type.base == BaseType::Float && left.kind == ValueKind::FloatRegister
+              ? left.label
+              : "ft0";
+      const std::string right_reg =
+          right.type.base == BaseType::Float && right.kind == ValueKind::FloatRegister
+              ? right.label
+              : "ft1";
+      if (left_reg == "ft0") load_float(left, left_reg);
+      if (right_reg == "ft1") load_float(right, right_reg);
+      if (expression.text == "==")
+        line("feq.s t0, " + left_reg + ", " + right_reg);
+      else if (expression.text == "!=") {
+        line("feq.s t0, " + left_reg + ", " + right_reg);
+        line("xori t0, t0, 1");
+      } else if (expression.text == "<")
+        line("flt.s t0, " + left_reg + ", " + right_reg);
+      else if (expression.text == "<=")
+        line("fle.s t0, " + left_reg + ", " + right_reg);
+      else if (expression.text == ">")
+        line("flt.s t0, " + right_reg + ", " + left_reg);
+      else
+        line("fle.s t0, " + right_reg + ", " + left_reg);
+      line("bnez t0, " + true_label);
+      return true;
+    }
+    if (left.kind == ValueKind::IntRegister && right.kind == ValueKind::ImmediateInt) {
+      const std::int64_t constant = right.integer;
+      if (expression.text == "==" && constant == 0) {
+        line("beqz " + left.label + ", " + true_label);
+        return true;
+      }
+      if (expression.text == "!=" && constant == 0) {
+        line("bnez " + left.label + ", " + true_label);
+        return true;
+      }
+      const bool inclusive = expression.text == "<=" || expression.text == ">";
+      const std::int64_t threshold = constant + (inclusive ? 1 : 0);
+      if ((expression.text == "<" || expression.text == "<=" || expression.text == ">" ||
+           expression.text == ">=") &&
+          threshold >= -2048 && threshold <= 2047) {
+        line("slti t0, " + left.label + ", " + std::to_string(threshold));
+        const bool true_when_less = expression.text == "<" || expression.text == "<=";
+        line(std::string(true_when_less ? "bnez t0, " : "beqz t0, ") + true_label);
+        return true;
+      }
+    }
+    const std::string left_reg =
+        left.kind == ValueKind::IntRegister ? left.label : "t0";
+    const std::string right_reg =
+        right.kind == ValueKind::IntRegister ? right.label : "t1";
+    if (left_reg == "t0") load_int(left, left_reg);
+    if (right_reg == "t1") load_int(right, right_reg);
+    const std::string instruction =
+        expression.text == "=="   ? "beq"
+        : expression.text == "!=" ? "bne"
+        : expression.text == "<"  ? "blt"
+        : expression.text == "<=" ? "ble"
+        : expression.text == ">"  ? "bgt"
+                                    : "bge";
+    line(instruction + " " + left_reg + ", " + right_reg + ", " + true_label);
+    return true;
+  }
+
+  void emit_cond_branch_true(const Expr& expression, const std::string& true_label) {
+    if (expression.kind == ExprKind::Binary && expression.text == "&&") {
+      const std::string skip = new_label("and_false");
+      emit_cond_fallthrough_true(*expression.left, skip);
+      emit_cond_branch_true(*expression.right, true_label);
+      label(skip);
+      return;
+    }
+    if (expression.kind == ExprKind::Binary && expression.text == "||") {
+      emit_cond_branch_true(*expression.left, true_label);
+      emit_cond_branch_true(*expression.right, true_label);
+      return;
+    }
+    if (expression.kind == ExprKind::Unary && expression.text == "!") {
+      const std::string pass = new_label("not_false");
+      emit_cond(*expression.left, pass, true_label);
+      label(pass);
+      return;
+    }
+    if (emit_comparison_branch_true(expression, true_label)) return;
+    Value value = emit_expr(expression);
+    if (!value.type.is_scalar()) fail(expression.loc, "condition must be scalar");
+    if (value.type.base == BaseType::Float) {
+      load_float(value, "ft0");
+      line("fmv.w.x ft1, zero");
+      line("feq.s t0, ft0, ft1");
+      line("beqz t0, " + true_label);
+    } else {
+      const std::string reg = value.kind == ValueKind::IntRegister ? value.label : "t0";
+      if (reg == "t0") load_int(value, reg);
+      line("bnez " + reg + ", " + true_label);
     }
   }
 
@@ -1391,20 +1673,45 @@ class Generator {
     bool floating{};
   };
 
-  void assign_scalar_register(Symbol& symbol) {
+  void assign_scalar_register(Symbol& symbol, const std::string& name) {
     if (options_.optimization != OptimizationLevel::O1 || !symbol.type.is_scalar() ||
         symbol.is_const)
       return;
-    if (symbol.type.base == BaseType::Int && next_int_register_ < 11) {
-      const std::size_t index = next_int_register_++;
+    std::optional<std::size_t> planned;
+    if (current_register_plan_ && !name.empty()) {
+      const auto& category = symbol.type.base == BaseType::Float
+                                 ? current_register_plan_->floats
+                                 : current_register_plan_->integers;
+      auto found = category.find(name);
+      if (found == category.end()) return;
+      planned = found->second;
+    }
+    if (symbol.type.base == BaseType::Int) {
+      std::size_t index = planned.value_or(11);
+      if (!planned) {
+        for (std::size_t candidate = 0; candidate < 11; ++candidate)
+          if (!saved_int_registers_[candidate] && !planned_int_registers_.count(candidate)) {
+            index = candidate;
+            break;
+          }
+      }
+      if (index >= 11) return;
       symbol.storage = Storage::IntRegister;
       symbol.reg = "s" + std::to_string(index + 1);
       if (!saved_int_registers_[index]) {
         saved_int_registers_[index] = true;
         saved_registers_.push_back(SavedRegister{symbol.reg, allocate(8), false});
       }
-    } else if (symbol.type.base == BaseType::Float && next_float_register_ < 12) {
-      const std::size_t index = next_float_register_++;
+    } else if (symbol.type.base == BaseType::Float) {
+      std::size_t index = planned.value_or(12);
+      if (!planned) {
+        for (std::size_t candidate = 0; candidate < 12; ++candidate)
+          if (!saved_float_registers_[candidate] && !planned_float_registers_.count(candidate)) {
+            index = candidate;
+            break;
+          }
+      }
+      if (index >= 12) return;
       symbol.storage = Storage::FloatRegister;
       symbol.reg = "fs" + std::to_string(index);
       if (!saved_float_registers_[index]) {
@@ -1422,7 +1729,7 @@ class Generator {
     symbol.type = resolve_decl_type(declaration.base, declaration.dimensions);
     symbol.is_const = declaration.is_const;
     const std::uint64_t count = symbol.type.dimensions.empty() ? 1 : element_count(symbol.type);
-    assign_scalar_register(symbol);
+    assign_scalar_register(symbol, declaration.name);
     if (symbol.storage == Storage::Local) symbol.offset = allocate(count * 4, 8);
     scope[declaration.name] = symbol;
     Symbol& stored = scope[declaration.name];
@@ -1557,18 +1864,18 @@ class Generator {
         return;
       }
       case StmtKind::While: {
-        const std::string head = new_label("while_head");
+        const std::string test = new_label("while_test");
         const std::string body = new_label("while_body");
         const std::string done = new_label("while_done");
-        label(head);
-        emit_cond_fallthrough_true(*statement.expression, done);
+        line("j " + test);
         label(body);
         break_labels_.push_back(done);
-        continue_labels_.push_back(head);
+        continue_labels_.push_back(test);
         emit_stmt(*statement.first);
         continue_labels_.pop_back();
         break_labels_.pop_back();
-        line("j " + head);
+        label(test);
+        emit_cond_branch_true(*statement.expression, body);
         label(done);
         return;
       }
@@ -1694,7 +2001,7 @@ class Generator {
       const Symbol& global = globals_by_name_.at(name);
       Symbol cached;
       cached.type = global.type;
-      assign_scalar_register(cached);
+      assign_scalar_register(cached, "");
       if (cached.storage == Storage::IntRegister) {
         load_int(local_value(global), cached.reg);
       } else if (cached.storage == Storage::FloatRegister) {
@@ -1754,6 +2061,16 @@ class Generator {
     epilogue_label_ = ".L" + function.name + "_epilogue";
     label_counter_ = 0;
     next_offset_ = 16;
+    auto plan = register_plans_.find(function.name);
+    current_register_plan_ = plan == register_plans_.end() ? nullptr : &plan->second;
+    planned_int_registers_.clear();
+    planned_float_registers_.clear();
+    if (current_register_plan_) {
+      for (const auto& item : current_register_plan_->integers)
+        planned_int_registers_.insert(item.second);
+      for (const auto& item : current_register_plan_->floats)
+        planned_float_registers_.insert(item.second);
+    }
     next_int_register_ = 0;
     next_float_register_ = 0;
     saved_int_registers_.fill(false);
@@ -1776,7 +2093,7 @@ class Generator {
       Symbol symbol;
       symbol.type = resolve_param_type(param);
       symbol.storage = param.is_array ? Storage::ParamPointer : Storage::Local;
-      assign_scalar_register(symbol);
+      assign_scalar_register(symbol, param.name);
       if (symbol.storage == Storage::Local || symbol.storage == Storage::ParamPointer)
         symbol.offset = allocate(8);
       scopes_.back()[param.name] = symbol;
@@ -1822,18 +2139,21 @@ class Generator {
     }
     current_stream_ = previous;
     const std::uint64_t frame = align_up(next_offset_, 16);
+    const std::string body_text = body.str();
+    const bool leaf = body_text.find("  call ") == std::string::npos;
     output_ << ".section .text\n.align 2\n.globl " << function.name << '\n'
             << ".type " << function.name << ", @function\n" << function.name << ":\n"
             << "  li t0, " << frame << "\n"
             << "  sub sp, sp, t0\n"
-            << "  add t1, sp, t0\n"
-            << "  sd ra, -8(t1)\n"
+            << "  add t1, sp, t0\n";
+    if (!leaf) output_ << "  sd ra, -8(t1)\n";
+    output_
             << "  sd s0, -16(t1)\n"
             << "  mv s0, t1\n"
-            << save_stream.str() << param_stream.str() << body.str() << epilogue_label_ << ":\n"
-            << global_writeback_stream.str() << restore_stream.str()
-            << "  ld ra, -8(s0)\n"
-            << "  ld t0, -16(s0)\n"
+            << save_stream.str() << param_stream.str() << body_text << epilogue_label_ << ":\n"
+            << global_writeback_stream.str() << restore_stream.str();
+    if (!leaf) output_ << "  ld ra, -8(s0)\n";
+    output_ << "  ld t0, -16(s0)\n"
             << "  mv sp, s0\n"
             << "  mv s0, t0\n"
             << "  ret\n.size " << function.name << ", .-" << function.name << "\n\n";
@@ -1867,6 +2187,10 @@ class Generator {
   std::vector<std::unordered_map<std::string, Value>> inline_bindings_;
   std::unordered_map<std::string, Value> global_register_bindings_;
   std::vector<std::string> global_writeback_names_;
+  std::unordered_map<std::string, ir::RegisterPlan> register_plans_;
+  const ir::RegisterPlan* current_register_plan_{};
+  std::unordered_set<std::size_t> planned_int_registers_;
+  std::unordered_set<std::size_t> planned_float_registers_;
 };
 
 }  // namespace
