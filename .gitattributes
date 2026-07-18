@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+*.pdf binary
+*.zip binary
+
+src/generated/* linguist-generated=true
+src/generated/* whitespace=-trailing-space,-space-before-tab
+docs/compiler2026-main/runtime/* whitespace=-trailing-space,-space-before-tab

@@ -1,0 +1,15 @@
+extra_code/
+bak/
+build*/
+compiler
+*.profraw
+*.profdata
+__pycache__/
+*.pyc
+.claude/
+.DS_Store
+
+# Reference archives not required by the RV64GC compiler or its test suite.
+docs/compiler2026-main/2026初赛ARM赛道功能用例.zip
+docs/compiler2026-main/2026初赛ARM赛道性能用例.zip
+docs/compiler2026-main/newlib-4.5.0.20241231.zip

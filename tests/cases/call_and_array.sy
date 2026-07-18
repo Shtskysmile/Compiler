@@ -1,0 +1,16 @@
+int values[8];
+
+int recursive_sum(int left, int right) {
+  if (left + 1 >= right) return values[left];
+  int middle = (left + right) / 2;
+  return recursive_sum(left, middle) + recursive_sum(middle, right);
+}
+
+int main() {
+  int count = getarray(values);
+  putint(count);
+  putch(10);
+  putint(recursive_sum(0, count));
+  putch(10);
+  return 0;
+}

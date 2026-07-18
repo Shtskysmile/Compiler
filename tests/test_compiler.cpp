@@ -1,0 +1,380 @@
+#include "sysy/compiler.hpp"
+#include "ir.hpp"
+
+#include <cstdlib>
+#include <iostream>
+#include <string>
+
+namespace {
+
+int failures = 0;
+
+void check(bool condition, const char* expression, int line) {
+  if (condition) return;
+  std::cerr << "line " << line << ": check failed: " << expression << '\n';
+  ++failures;
+}
+
+#define CHECK(expr) check(static_cast<bool>(expr), #expr, __LINE__)
+
+bool contains(const std::string& text, const std::string& needle) {
+  return text.find(needle) != std::string::npos;
+}
+
+std::size_t count_occurrences(const std::string& text, const std::string& needle) {
+  std::size_t count = 0;
+  for (std::size_t pos = 0; (pos = text.find(needle, pos)) != std::string::npos;
+       pos += needle.size())
+    ++count;
+  return count;
+}
+
+bool contains_adjacent_temp_round_trip(const std::string& text) {
+  std::size_t line_start = 0;
+  while (line_start < text.size()) {
+    const std::size_t line_end = text.find('\n', line_start);
+    const std::string line = text.substr(line_start, line_end - line_start);
+    const std::size_t next_start = line_end == std::string::npos ? text.size() : line_end + 1;
+    const std::size_t next_end = text.find('\n', next_start);
+    const std::string next = text.substr(next_start, next_end - next_start);
+    const bool matching_ops =
+        (line.rfind("  sw ", 0) == 0 && next.rfind("  lw ", 0) == 0) ||
+        (line.rfind("  fsw ", 0) == 0 && next.rfind("  flw ", 0) == 0);
+    const std::size_t comma = line.find(", ");
+    const std::size_t next_comma = next.find(", ");
+    if (matching_ops && comma != std::string::npos && next_comma != std::string::npos &&
+        line.substr(comma + 2) == next.substr(next_comma + 2))
+      return true;
+    line_start = next_start;
+  }
+  return false;
+}
+
+void test_minimal_program() {
+  auto result = sysy::compile_source("int main(){return 3;}", "minimal.sy");
+  CHECK(result.ok);
+  CHECK(result.diagnostics.empty());
+  CHECK(contains(result.assembly, ".globl main"));
+  CHECK(contains(result.assembly, "main:"));
+  CHECK(contains(result.assembly, "li a0, 3"));
+  CHECK(contains(result.assembly, "ret"));
+}
+
+void test_integer_control_flow_and_short_circuit() {
+  const char* source = R"(
+    int side() { return 1; }
+    int main() {
+      int a = 4, b = 2;
+      if (a > b && side()) a = a + b * 3;
+      while (a > 3) { a = a - 1; if (a == 5) break; }
+      return a % 4;
+    })";
+  auto result = sysy::compile_source(source, "flow.sy");
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "call side"));
+  CHECK(contains(result.assembly, "remw"));
+  CHECK(contains(result.assembly, "beqz"));
+}
+
+void test_float_conversion_and_runtime_calls() {
+  const char* source = R"(
+    float twice(float x) { return x * 2; }
+    int main() {
+      float x = 0x1.8p+1;
+      putfloat(twice(x));
+      return x;
+    })";
+  auto result = sysy::compile_source(source, "float.sy");
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "fmul.s"));
+  CHECK(contains(result.assembly, "call twice"));
+  CHECK(contains(result.assembly, "call putfloat"));
+  CHECK(contains(result.assembly, "fcvt.w.s"));
+}
+
+void test_arrays_and_stack_arguments() {
+  const char* source = R"(
+    int sum(int a[], int x0, int x1, int x2, int x3, int x4, int x5,
+            int x6, int x7, int x8) { return a[1] + x8; }
+    int data[3] = {1, 2};
+    int main() { return sum(data, 0,1,2,3,4,5,6,7,8); }
+  )";
+  auto result = sysy::compile_source(source, "array.sy");
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, ".data"));
+  CHECK(contains(result.assembly, ".word 1"));
+  CHECK(contains(result.assembly, "call sum"));
+  CHECK(contains(result.assembly, "sd "));
+}
+
+void test_diagnostics() {
+  auto parse = sysy::compile_source("int main( { return 0; }", "bad.sy");
+  CHECK(!parse.ok);
+  CHECK(parse.assembly.empty());
+  CHECK(!parse.diagnostics.empty());
+  CHECK(parse.diagnostics.front().file == "bad.sy");
+  CHECK(parse.diagnostics.front().line == 1);
+  CHECK(parse.diagnostics.front().column > 1);
+
+  auto semantic = sysy::compile_source("int main(){return missing;}", "semantic.sy");
+  CHECK(!semantic.ok);
+  CHECK(contains(semantic.diagnostics.front().message, "missing"));
+}
+
+void test_o1_is_general_and_valid() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(
+      "int main(){int a=2*3; int dead=9; return a+0;}", "o1.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "li a0, 6"));
+}
+
+void expect_error(const char* source) {
+  auto result = sysy::compile_source(source, "invalid.sy");
+  CHECK(!result.ok);
+  CHECK(result.assembly.empty());
+  CHECK(!result.diagnostics.empty());
+}
+
+void test_semantic_error_matrix() {
+  expect_error("int f(){return 0;}");
+  expect_error("void main(){return;}");
+  expect_error("int main(int x){return x;}");
+  expect_error("int x; int x; int main(){return 0;}");
+  expect_error("int f(){return 1;} int f(){return 2;} int main(){return f();}");
+  expect_error("int x; int x(){return 0;} int main(){return 0;}");
+  expect_error("int x=getint(); int main(){return 0;}");
+  expect_error("int x[0]; int main(){return 0;}");
+  expect_error("int x[2]={1,2,3}; int main(){return 0;}");
+  expect_error("int main(){const int x=getint(); return x;}");
+  expect_error("int main(){const int x=1; x=2; return x;}");
+  expect_error("int main(){int x[2]; x=1; return 0;}");
+  expect_error("int main(){int x; return x[0];}");
+  expect_error("int main(){int x[2]; return x[1.0];}");
+  expect_error("int main(){float x=1.0; return x%2;}");
+  expect_error("int main(){int x[2]; return -x;}");
+  expect_error("int f(int a[]){return a[0];} int main(){return f(1);}");
+  expect_error("int f(int x){return x;} int main(){int a[1]; return f(a);}");
+  expect_error("int f(int x){return x;} int main(){return f();}");
+  expect_error("int main(){return missing();}");
+  expect_error("int f(int x,int x){return x;} int main(){return 0;}");
+  expect_error("int main(){int x; int x; return 0;}");
+  expect_error("int main(){break; return 0;}");
+  expect_error("int main(){continue; return 0;}");
+  expect_error("void f(){return 1;} int main(){return 0;}");
+  expect_error("int f(){return;} int main(){return 0;}");
+  expect_error("int main(){/* unterminated");
+  expect_error("int main(){return 09;}");
+}
+
+void test_source_limit() {
+  std::string source(64U * 1024U * 1024U + 1U, ' ');
+  auto result = sysy::compile_source(source, "huge.sy");
+  CHECK(!result.ok);
+  CHECK(contains(result.diagnostics.front().message, "64 MiB"));
+}
+
+void test_o1_keeps_scalars_in_callee_saved_registers() {
+  const char* source = R"(
+    float accumulate(int n, float scale) {
+      int i = 0;
+      float total = 0.0;
+      while (i < n) {
+        total = total + scale;
+        putint(i);
+        i = i + 1;
+      }
+      return total;
+    }
+    float ninth(float x0, float x1, float x2, float x3, float x4,
+                float x5, float x6, float x7, float x8) { return x8; }
+    int main() { return accumulate(3, 2.0) + ninth(0.,0.,0.,0.,0.,0.,0.,0.,1.); }
+  )";
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(source, "registers.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "sd s1,"));
+  CHECK(contains(result.assembly, "fsd fs0,"));
+  CHECK(contains(result.assembly, "mv s1, a0"));
+  CHECK(contains(result.assembly, "fmv.s fs0, fa0"));
+  CHECK(contains(result.assembly, "fmv.w.x fs8, a0"));
+  CHECK(contains(result.assembly, "ld s1,"));
+  CHECK(contains(result.assembly, "fld fs0,"));
+}
+
+void test_o1_fuses_simple_array_addressing() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(
+      "int data[16]; int main(){int i=getint(); return data[i];}",
+      "addressing.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "slli t1, t1, 2"));
+  CHECK(!contains(result.assembly, "li t2, 4"));
+  CHECK(!contains(result.assembly, "sd t0,"));
+}
+
+void test_o1_forwards_immediately_consumed_temporaries() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(
+      "int main(){int i=0; float f=1.0; i=i+1; f=f+2.0; return i+f;}",
+      "forward.sy", options);
+  CHECK(result.ok);
+  CHECK(!contains_adjacent_temp_round_trip(result.assembly));
+}
+
+void test_o1_inlines_small_leaf_functions_once() {
+  const char* source = R"(
+    int state;
+    int tick() { state = state + 1; return state; }
+    int twice(int x) { return x + x; }
+    int index_of(int row, int col, int width) { return row * width + col; }
+    int data[16];
+    int main() { return data[index_of(1, 2, 4)] + twice(tick()); }
+  )";
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(source, "inline.sy", options);
+  CHECK(result.ok);
+  CHECK(!contains(result.assembly, "call index_of"));
+  CHECK(!contains(result.assembly, "call twice"));
+  CHECK(count_occurrences(result.assembly, "call tick") == 1);
+}
+
+void test_o1_hoists_readonly_globals_without_calls() {
+  const char* source = R"(
+    int limit;
+    int run(int x) { while (x < limit) x = x + 1; return x; }
+    int main() { limit = 4; return run(0); }
+  )";
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(source, "licm.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "lw s2, 0(t6)"));
+  CHECK(contains(result.assembly, "mv t1, s2"));
+}
+
+void test_typed_ir_optimizations_and_linear_scan() {
+  namespace ir = sysy::detail::ir;
+  ir::Function function;
+  function.name = "ir_test";
+  function.entry = 0;
+  function.blocks = {
+      ir::Block{0,
+                {{ir::Opcode::ConstInt, ir::Type::I32, 1, {}, 4},
+                 {ir::Opcode::Add, ir::Type::I32, 2, {1, 1}},
+                 {ir::Opcode::Branch, ir::Type::Void, 0, {}}},
+                {1}},
+      ir::Block{1,
+                {{ir::Opcode::Add, ir::Type::I32, 3, {1, 1}},
+                 {ir::Opcode::Add, ir::Type::I32, 4, {1, 1}},
+                 {ir::Opcode::Mul, ir::Type::I32, 5, {3, 4}},
+                 {ir::Opcode::Return, ir::Type::Void, 0, {5}}},
+                {}},
+      ir::Block{2, {{ir::Opcode::Return, ir::Type::Void, 0, {}}}, {}}};
+
+  ir::remove_unreachable_blocks(function);
+  CHECK(function.blocks.size() == 2);
+  ir::eliminate_local_common_subexpressions(function);
+  CHECK(function.blocks[1].instructions[1].opcode == ir::Opcode::Copy);
+  ir::hoist_loop_invariants(function, ir::Loop{0, {1}});
+  CHECK(function.blocks[0].instructions.size() > 3);
+  ir::propagate_constants_and_copies(function);
+  ir::simplify_algebra(function);
+  ir::eliminate_dead_code(function);
+  auto allocation = ir::linear_scan_allocate(function, 2, 2);
+  CHECK(!allocation.empty());
+  bool has_integer_register = false;
+  for (const auto& item : allocation)
+    has_integer_register = has_integer_register ||
+                           item.second.kind == ir::Allocation::Kind::IntegerRegister;
+  CHECK(has_integer_register);
+}
+
+void test_typed_ir_edge_paths() {
+  namespace ir = sysy::detail::ir;
+  ir::Function constants;
+  constants.entry = 0;
+  constants.blocks = {ir::Block{
+      0,
+      {{ir::Opcode::ConstInt, ir::Type::I32, 1, {}, 0},
+       {ir::Opcode::ConstInt, ir::Type::I32, 2, {}, 1},
+       {ir::Opcode::ConstFloat, ir::Type::F32, 3, {}, 0, 2.0F},
+       {ir::Opcode::ConstFloat, ir::Type::F32, 4, {}, 0, 4.0F},
+       {ir::Opcode::Add, ir::Type::I32, 5, {1, 2}},
+       {ir::Opcode::Sub, ir::Type::I32, 6, {2, 1}},
+       {ir::Opcode::Mul, ir::Type::I32, 7, {2, 2}},
+       {ir::Opcode::Div, ir::Type::F32, 8, {4, 3}},
+       {ir::Opcode::Add, ir::Type::F32, 9, {3, 4}},
+       {ir::Opcode::Sub, ir::Type::F32, 10, {4, 3}},
+       {ir::Opcode::Mul, ir::Type::F32, 11, {3, 4}},
+       {ir::Opcode::IntToFloat, ir::Type::F32, 12, {2}},
+       {ir::Opcode::FloatToInt, ir::Type::I32, 13, {4}},
+       {ir::Opcode::Copy, ir::Type::I32, 14, {2}},
+       {ir::Opcode::Return, ir::Type::Void, 0, {5, 6, 7, 8, 9, 10, 11, 12, 13, 14}}},
+      {}}};
+  ir::propagate_constants_and_copies(constants);
+  CHECK(constants.blocks[0].instructions[7].opcode == ir::Opcode::ConstFloat);
+
+  ir::Function algebra;
+  algebra.entry = 0;
+  algebra.blocks = {ir::Block{
+      0,
+      {{ir::Opcode::ConstInt, ir::Type::I32, 1, {}, 0},
+       {ir::Opcode::ConstInt, ir::Type::I32, 2, {}, 1},
+       {ir::Opcode::Add, ir::Type::I32, 3, {2, 1}},
+       {ir::Opcode::Add, ir::Type::I32, 4, {1, 2}},
+       {ir::Opcode::Sub, ir::Type::I32, 5, {2, 1}},
+       {ir::Opcode::Mul, ir::Type::I32, 6, {2, 2}},
+       {ir::Opcode::Div, ir::Type::I32, 7, {2, 2}},
+       {ir::Opcode::Store, ir::Type::Void, 0, {3, 4, 5, 6, 7}}},
+      {}}};
+  ir::simplify_algebra(algebra);
+  for (std::size_t i = 2; i <= 6; ++i)
+    CHECK(algebra.blocks[0].instructions[i].opcode == ir::Opcode::Copy);
+  CHECK(!ir::is_pure(algebra.blocks[0].instructions.back()));
+
+  ir::Function allocation;
+  allocation.entry = 0;
+  allocation.blocks = {ir::Block{
+      0,
+      {{ir::Opcode::ConstInt, ir::Type::I32, 1, {}, 1},
+       {ir::Opcode::ConstFloat, ir::Type::F32, 2, {}, 0, 1.0F},
+       {ir::Opcode::Return, ir::Type::Void, 0, {1, 2}}},
+      {}}};
+  auto spilled = ir::linear_scan_allocate(allocation, 0, 0);
+  CHECK(spilled.at(1).kind == ir::Allocation::Kind::Stack);
+  CHECK(spilled.at(2).kind == ir::Allocation::Kind::Stack);
+  ir::hoist_loop_invariants(allocation, ir::Loop{99, {0}});
+  ir::eliminate_dead_code(allocation);
+  CHECK(allocation.blocks[0].instructions.size() == 3);
+}
+
+}  // namespace
+
+int main() {
+  test_minimal_program();
+  test_integer_control_flow_and_short_circuit();
+  test_float_conversion_and_runtime_calls();
+  test_arrays_and_stack_arguments();
+  test_diagnostics();
+  test_o1_is_general_and_valid();
+  test_semantic_error_matrix();
+  test_source_limit();
+  test_o1_keeps_scalars_in_callee_saved_registers();
+  test_o1_fuses_simple_array_addressing();
+  test_o1_forwards_immediately_consumed_temporaries();
+  test_o1_inlines_small_leaf_functions_once();
+  test_o1_hoists_readonly_globals_without_calls();
+  test_typed_ir_optimizations_and_linear_scan();
+  test_typed_ir_edge_paths();
+  if (failures != 0) {
+    std::cerr << failures << " test checks failed\n";
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
+}

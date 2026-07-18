@@ -1,0 +1,17 @@
+float rows[40][3];
+
+int main() {
+  int k = getint();
+  int i = 0;
+  while (i < 40) {
+    getfarray(rows[i]);
+    i = i + 1;
+  }
+  i = 0;
+  while (i < 40) {
+    putfloat(rows[i][k]);
+    putch(10);
+    i = i + 1;
+  }
+  return 0;
+}

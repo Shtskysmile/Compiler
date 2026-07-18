@@ -1,0 +1,15 @@
+int main() {
+  int count = 0;
+  int sum = 0;
+  int ch = getch();
+  while (ch != 35) {
+    count = count + 1;
+    sum = sum + ch;
+    ch = getch();
+  }
+  putint(count);
+  putch(10);
+  putint(sum);
+  putch(10);
+  return 0;
+}
