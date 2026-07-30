@@ -375,6 +375,88 @@ void test_o1_hoists_loop_invariant_pure_calls() {
   CHECK(hoisted < loop_body);
 }
 
+void test_o1_hoists_pure_calls_with_invariant_global_scalar_arguments() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int d;
+    int power(int a, int b) {
+      if (b == 0) return 1;
+      return a * power(a, b - 1);
+    }
+    int values[16];
+    int main() {
+      d = 3;
+      int i = 0;
+      while (i < 16) {
+        values[i] = values[i] * power(d, 5);
+        i = i + 1;
+      }
+      return values[0];
+    }
+  )", "global-scalar-pure-call-licm.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "call power") == 2);
+  const std::size_t hoisted = result.assembly.rfind("call power");
+  const std::size_t loop_body = result.assembly.find(".Lmain_while_body");
+  CHECK(hoisted < loop_body);
+}
+
+void test_o1_allows_pure_scalar_parameters_to_shadow_globals() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int b[16];
+    int d;
+    int power(int a, int b) {
+      if (b == 0) return 1;
+      return a * power(a, b - 1);
+    }
+    int values[16];
+    int main() {
+      d = 3;
+      int i = 0;
+      while (i < 16) {
+        values[i] = values[i] * power(d, 5);
+        i = i + 1;
+      }
+      return values[0];
+    }
+  )", "shadowed-global-parameter-pure-call-licm.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "call power") == 2);
+  const std::size_t hoisted = result.assembly.rfind("call power");
+  const std::size_t loop_body = result.assembly.find(".Lmain_while_body");
+  CHECK(hoisted < loop_body);
+}
+
+void test_o1_does_not_hoist_pure_calls_with_assigned_global_arguments() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int d;
+    int power(int a, int b) {
+      if (b == 0) return 1;
+      return a * power(a, b - 1);
+    }
+    int values[4];
+    int main() {
+      d = 2;
+      int i = 0;
+      while (i < 4) {
+        values[i] = power(d, 3);
+        d = d + 1;
+        i = i + 1;
+      }
+      return values[3];
+    }
+  )", "assigned-global-pure-call-licm.sy", options);
+  CHECK(result.ok);
+  const std::size_t call = result.assembly.rfind("call power");
+  const std::size_t loop_body = result.assembly.find(".Lmain_while_body");
+  CHECK(call > loop_body);
+}
+
 void test_o1_does_not_hoist_impure_calls() {
   sysy::CompileOptions options;
   options.optimization = sysy::OptimizationLevel::O1;
@@ -438,6 +520,103 @@ void test_o1_does_not_reorder_pure_and_impure_calls() {
   const std::size_t power = result.assembly.rfind("call power");
   const std::size_t loop_body = result.assembly.find(".Lmain_while_body");
   CHECK(power > loop_body);
+}
+
+void test_o1_reuses_pure_calls_across_straight_line_statements() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int helper(int x) {
+      int y = x + 1;
+      return y * y;
+    }
+    int main() {
+      int x = 3;
+      int a = helper(x);
+      int b = helper(x);
+      return a + b;
+    }
+  )", "straight-line-pure-call-cse.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "call helper") == 1);
+}
+
+void test_o1_invalidates_pure_call_cache_after_argument_assignment() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int helper(int x) {
+      int y = x + 1;
+      return y * y;
+    }
+    int main() {
+      int x = 3;
+      int a = helper(x);
+      x = x + 1;
+      int b = helper(x);
+      return a + b;
+    }
+  )", "assigned-argument-pure-call-cse.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "call helper") == 2);
+}
+
+void test_o1_does_not_reuse_pure_calls_across_io() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int helper(int x) {
+      int y = x + 1;
+      return y * y;
+    }
+    int main() {
+      int x = 3;
+      int a = helper(x);
+      putint(a);
+      int b = helper(x);
+      return b;
+    }
+  )", "io-boundary-pure-call-cse.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "call helper") == 2);
+}
+
+void test_o1_reuses_pure_calls_with_identical_array_reads_before_writeback() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int values[4];
+    int helper(int x) {
+      int y = x + 1;
+      return y * y;
+    }
+    int main() {
+      values[0] = helper(values[1]) + helper(values[1]);
+      return values[0];
+    }
+  )", "array-read-pure-call-cse.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "call helper") == 1);
+}
+
+void test_o1_invalidates_array_dependent_pure_calls_after_array_write() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int values[4];
+    int helper(int x) {
+      int y = x + 1;
+      return y * y;
+    }
+    int main() {
+      int a = helper(values[0]);
+      values[0] = 2;
+      int b = helper(values[0]);
+      return a + b;
+    }
+  )", "array-write-pure-call-cse.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "call helper") == 2);
 }
 
 void test_o1_strength_reduces_signed_power_of_two_division() {
@@ -761,9 +940,17 @@ int main() {
   test_o1_strength_reduces_loop_array_addresses_to_pointer_increments();
   test_o1_inducts_the_complete_multidimensional_address();
   test_o1_hoists_loop_invariant_pure_calls();
+  test_o1_hoists_pure_calls_with_invariant_global_scalar_arguments();
+  test_o1_allows_pure_scalar_parameters_to_shadow_globals();
+  test_o1_does_not_hoist_pure_calls_with_assigned_global_arguments();
   test_o1_does_not_hoist_impure_calls();
   test_o1_does_not_hoist_pure_calls_with_impure_arguments();
   test_o1_does_not_reorder_pure_and_impure_calls();
+  test_o1_reuses_pure_calls_across_straight_line_statements();
+  test_o1_invalidates_pure_call_cache_after_argument_assignment();
+  test_o1_does_not_reuse_pure_calls_across_io();
+  test_o1_reuses_pure_calls_with_identical_array_reads_before_writeback();
+  test_o1_invalidates_array_dependent_pure_calls_after_array_write();
   test_o1_strength_reduces_signed_power_of_two_division();
   test_o1_keeps_array_values_and_destinations_in_scratch_registers();
   test_o1_caches_hot_global_array_bases();

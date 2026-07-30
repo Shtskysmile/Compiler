@@ -535,6 +535,13 @@ class Generator {
     std::unordered_set<std::string> callees;
   };
 
+  struct StatementCallBinding {
+    const Expr* expression{};
+    std::size_t occurrences{};
+    bool array_dependent{};
+    std::optional<Value> value;
+  };
+
   bool analyze_pure_expression(const Expr& expression,
                                const std::unordered_set<std::string>& locals,
                                PurityInfo& info) const {
@@ -613,7 +620,7 @@ class Generator {
       info.eligible = signature.result.is_scalar();
       std::unordered_set<std::string> locals;
       for (const ParamDecl& param : function.params) {
-        if (param.is_array || globals_by_name_.count(param.name)) info.eligible = false;
+        if (param.is_array) info.eligible = false;
         locals.insert(param.name);
       }
       if (info.eligible && !collect_pure_locals(*function.body, locals))
@@ -1060,6 +1067,13 @@ class Generator {
       for (const LoopValueBinding& binding : *frame)
         if (expressions_equivalent(*binding.expression, expression)) return binding.value;
     }
+    for (auto frame = statement_call_bindings_.rbegin();
+         frame != statement_call_bindings_.rend(); ++frame) {
+      for (const StatementCallBinding& binding : *frame)
+        if (binding.value &&
+            expressions_equivalent(*binding.expression, expression))
+          return *binding.value;
+    }
     if (options_.optimization == OptimizationLevel::O1 && inline_bindings_.empty()) {
       auto folded = eval_const(expression);
       if (folded) return immediate(*folded);
@@ -1088,7 +1102,27 @@ class Generator {
       }
       case ExprKind::Unary: return emit_unary(expression);
       case ExprKind::Binary: return emit_binary(expression, false);
-      case ExprKind::Call: return emit_call(expression);
+      case ExprKind::Call: {
+        Value value = emit_call(expression);
+        for (auto frame = statement_call_bindings_.rbegin();
+             frame != statement_call_bindings_.rend(); ++frame) {
+          for (StatementCallBinding& binding : *frame) {
+            if (binding.value ||
+                !expressions_equivalent(*binding.expression, expression))
+              continue;
+            if (value.type.base == BaseType::Float) {
+              load_float(value, "ft0");
+              value = store_float_temp("ft0", false);
+            } else {
+              load_int(value, "t0");
+              value = store_int_temp("t0", false);
+            }
+            binding.value = value;
+            return value;
+          }
+        }
+        return value;
+      }
     }
     fail(expression.loc, "unsupported expression");
   }
@@ -2165,14 +2199,34 @@ class Generator {
     if (expression.kind == ExprKind::Call && !pure_functions_.count(expression.text))
       return false;
     if (expression.kind == ExprKind::Name) {
-      auto global = globals_by_name_.find(expression.text);
-      if (global != globals_by_name_.end() && !global->second.constant) return false;
+      const Symbol* symbol = find_symbol(expression.text);
+      if (symbol && !symbol->type.is_scalar()) return false;
     }
     if (expression.left && !expression_is_pure_scalar(*expression.left)) return false;
     if (expression.right && !expression_is_pure_scalar(*expression.right)) return false;
     for (const auto& argument : expression.args)
       if (!expression_is_pure_scalar(*argument)) return false;
     return true;
+  }
+
+  bool expression_is_call_cacheable(const Expr& expression) const {
+    if (expression.kind == ExprKind::String) return false;
+    if (expression.kind == ExprKind::Call && !pure_functions_.count(expression.text))
+      return false;
+    if (expression.left && !expression_is_call_cacheable(*expression.left)) return false;
+    if (expression.right && !expression_is_call_cacheable(*expression.right)) return false;
+    for (const auto& argument : expression.args)
+      if (!expression_is_call_cacheable(*argument)) return false;
+    return true;
+  }
+
+  bool expression_contains_subscript(const Expr& expression) const {
+    if (expression.kind == ExprKind::Subscript) return true;
+    if (expression.left && expression_contains_subscript(*expression.left)) return true;
+    if (expression.right && expression_contains_subscript(*expression.right)) return true;
+    for (const auto& argument : expression.args)
+      if (expression_contains_subscript(*argument)) return true;
+    return false;
   }
 
   bool expression_contains_impure_call(const Expr& expression) const {
@@ -2191,6 +2245,77 @@ class Generator {
     for (const auto& element : initializer.elements)
       if (initializer_contains_impure_call(*element)) return true;
     return false;
+  }
+
+  bool statement_is_call_cacheable(const Stmt& statement) const {
+    if (statement.kind != StmtKind::Expression &&
+        statement.kind != StmtKind::Assignment &&
+        statement.kind != StmtKind::Declaration)
+      return false;
+    if ((statement.expression && expression_contains_impure_call(*statement.expression)) ||
+        (statement.value && expression_contains_impure_call(*statement.value)))
+      return false;
+    for (const VarDecl& declaration : statement.declarations)
+      if (declaration.initializer &&
+          initializer_contains_impure_call(*declaration.initializer))
+        return false;
+    return true;
+  }
+
+  void collect_statement_pure_calls(const Expr& expression,
+                                    std::vector<StatementCallBinding>& bindings) const {
+    if (expression.kind == ExprKind::Call && expression_is_call_cacheable(expression)) {
+      auto found = std::find_if(bindings.begin(), bindings.end(), [&](const auto& binding) {
+        return expressions_equivalent(*binding.expression, expression);
+      });
+      if (found == bindings.end())
+        bindings.push_back(StatementCallBinding{
+            &expression, 1, expression_contains_subscript(expression), std::nullopt});
+      else
+        ++found->occurrences;
+    }
+    if (expression.left) collect_statement_pure_calls(*expression.left, bindings);
+    if (expression.right) collect_statement_pure_calls(*expression.right, bindings);
+    for (const auto& argument : expression.args)
+      collect_statement_pure_calls(*argument, bindings);
+  }
+
+  void collect_initializer_pure_calls(
+      const Initializer& initializer,
+      std::vector<StatementCallBinding>& bindings) const {
+    if (initializer.expression)
+      collect_statement_pure_calls(*initializer.expression, bindings);
+    for (const auto& element : initializer.elements)
+      collect_initializer_pure_calls(*element, bindings);
+  }
+
+  void collect_statement_pure_calls(
+      const Stmt& statement, std::vector<StatementCallBinding>& bindings) const {
+    if (statement.expression)
+      collect_statement_pure_calls(*statement.expression, bindings);
+    if (statement.value) collect_statement_pure_calls(*statement.value, bindings);
+    for (const VarDecl& declaration : statement.declarations)
+      if (declaration.initializer)
+        collect_initializer_pure_calls(*declaration.initializer, bindings);
+  }
+
+  void invalidate_statement_call_values(const Stmt& statement) {
+    std::unordered_set<std::string> assigned;
+    if (statement.kind == StmtKind::Assignment && statement.expression &&
+        statement.expression->kind == ExprKind::Name)
+      assigned.insert(statement.expression->text);
+    for (const VarDecl& declaration : statement.declarations)
+      assigned.insert(declaration.name);
+    const bool writes_array = statement.kind == StmtKind::Assignment &&
+                              statement.expression &&
+                              statement.expression->kind == ExprKind::Subscript;
+    if (assigned.empty() && !writes_array) return;
+    for (auto& frame : statement_call_bindings_)
+      for (StatementCallBinding& binding : frame)
+        if (binding.value &&
+            ((writes_array && binding.array_dependent) ||
+             expression_uses_any_name(*binding.expression, assigned)))
+          binding.value.reset();
   }
 
   void collect_invariant_pure_calls(
@@ -2565,7 +2690,31 @@ class Generator {
         return;
       case StmtKind::Block:
         scopes_.emplace_back();
-        for (const auto& child : statement.statements) emit_stmt(*child);
+        for (std::size_t i = 0; i < statement.statements.size();) {
+          if (options_.optimization != OptimizationLevel::O1 ||
+              !statement_is_call_cacheable(*statement.statements[i])) {
+            emit_stmt(*statement.statements[i++]);
+            continue;
+          }
+          std::size_t end = i;
+          std::vector<StatementCallBinding> bindings;
+          while (end < statement.statements.size() &&
+                 statement_is_call_cacheable(*statement.statements[end])) {
+            collect_statement_pure_calls(*statement.statements[end], bindings);
+            ++end;
+          }
+          bindings.erase(
+              std::remove_if(bindings.begin(), bindings.end(),
+                             [](const auto& binding) { return binding.occurrences < 2; }),
+              bindings.end());
+          statement_call_bindings_.push_back(std::move(bindings));
+          while (i < end) {
+            emit_stmt(*statement.statements[i]);
+            invalidate_statement_call_values(*statement.statements[i]);
+            ++i;
+          }
+          statement_call_bindings_.pop_back();
+        }
         scopes_.pop_back();
         return;
       case StmtKind::If: {
@@ -3051,6 +3200,7 @@ class Generator {
   };
   std::vector<std::vector<LoopAddressBinding>> loop_address_bindings_;
   std::vector<std::vector<LoopValueBinding>> loop_value_bindings_;
+  std::vector<std::vector<StatementCallBinding>> statement_call_bindings_;
   std::array<bool, 11> active_loop_int_registers_{};
   std::array<bool, 4> active_loop_caller_registers_{};
   std::set<std::size_t> reusable_loop_int_registers_;
