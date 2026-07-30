@@ -215,6 +215,7 @@ class Generator {
 
   std::string run() {
     prepare_top_level();
+    if (options_.optimization == OptimizationLevel::O1) analyze_pure_functions();
     validate_main();
     emit_globals();
     for (const Function& function : program_.functions) emit_function(function);
@@ -526,6 +527,119 @@ class Generator {
       functions_[function.name] = signature;
       user_functions_.insert(function.name);
       function_defs_[function.name] = &function;
+    }
+  }
+
+  struct PurityInfo {
+    bool eligible{true};
+    std::unordered_set<std::string> callees;
+  };
+
+  bool analyze_pure_expression(const Expr& expression,
+                               const std::unordered_set<std::string>& locals,
+                               PurityInfo& info) const {
+    if (expression.kind == ExprKind::Subscript || expression.kind == ExprKind::String)
+      return false;
+    if (expression.kind == ExprKind::Name && !locals.count(expression.text)) {
+      auto global = globals_by_name_.find(expression.text);
+      if (global == globals_by_name_.end() || !global->second.constant ||
+          !global->second.type.is_scalar())
+        return false;
+    }
+    if (expression.kind == ExprKind::Call) info.callees.insert(expression.text);
+    if (expression.left && !analyze_pure_expression(*expression.left, locals, info))
+      return false;
+    if (expression.right && !analyze_pure_expression(*expression.right, locals, info))
+      return false;
+    for (const auto& argument : expression.args)
+      if (!analyze_pure_expression(*argument, locals, info)) return false;
+    return true;
+  }
+
+  bool analyze_pure_initializer(const Initializer& initializer,
+                                const std::unordered_set<std::string>& locals,
+                                PurityInfo& info) const {
+    if (initializer.expression &&
+        !analyze_pure_expression(*initializer.expression, locals, info))
+      return false;
+    for (const auto& element : initializer.elements)
+      if (!analyze_pure_initializer(*element, locals, info)) return false;
+    return true;
+  }
+
+  bool collect_pure_locals(const Stmt& statement,
+                           std::unordered_set<std::string>& locals) const {
+    for (const VarDecl& declaration : statement.declarations) {
+      if (!declaration.dimensions.empty() || globals_by_name_.count(declaration.name))
+        return false;
+      locals.insert(declaration.name);
+    }
+    for (const auto& child : statement.statements)
+      if (!collect_pure_locals(*child, locals)) return false;
+    if (statement.first && !collect_pure_locals(*statement.first, locals)) return false;
+    return !statement.second || collect_pure_locals(*statement.second, locals);
+  }
+
+  bool analyze_pure_statement(const Stmt& statement,
+                              const std::unordered_set<std::string>& locals,
+                              PurityInfo& info) const {
+    if (statement.kind == StmtKind::Assignment) {
+      if (!statement.expression || statement.expression->kind != ExprKind::Name ||
+          !locals.count(statement.expression->text))
+        return false;
+    } else if (statement.expression &&
+               !analyze_pure_expression(*statement.expression, locals, info)) {
+      return false;
+    }
+    if (statement.value && !analyze_pure_expression(*statement.value, locals, info))
+      return false;
+    for (const VarDecl& declaration : statement.declarations) {
+      if (declaration.initializer &&
+          !analyze_pure_initializer(*declaration.initializer, locals, info))
+        return false;
+    }
+    for (const auto& child : statement.statements)
+      if (!analyze_pure_statement(*child, locals, info)) return false;
+    if (statement.first && !analyze_pure_statement(*statement.first, locals, info))
+      return false;
+    return !statement.second || analyze_pure_statement(*statement.second, locals, info);
+  }
+
+  void analyze_pure_functions() {
+    std::unordered_map<std::string, PurityInfo> analyses;
+    for (const Function& function : program_.functions) {
+      PurityInfo info;
+      const FunctionSig& signature = functions_.at(function.name);
+      info.eligible = signature.result.is_scalar();
+      std::unordered_set<std::string> locals;
+      for (const ParamDecl& param : function.params) {
+        if (param.is_array || globals_by_name_.count(param.name)) info.eligible = false;
+        locals.insert(param.name);
+      }
+      if (info.eligible && !collect_pure_locals(*function.body, locals))
+        info.eligible = false;
+      if (info.eligible && !analyze_pure_statement(*function.body, locals, info))
+        info.eligible = false;
+      analyses.emplace(function.name, std::move(info));
+    }
+
+    for (const auto& [name, info] : analyses)
+      if (info.eligible) pure_functions_.insert(name);
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (auto it = pure_functions_.begin(); it != pure_functions_.end();) {
+        const auto& callees = analyses.at(*it).callees;
+        const bool all_pure = std::all_of(
+            callees.begin(), callees.end(),
+            [&](const std::string& callee) { return pure_functions_.count(callee) != 0; });
+        if (all_pure) {
+          ++it;
+        } else {
+          it = pure_functions_.erase(it);
+          changed = true;
+        }
+      }
     }
   }
 
@@ -941,6 +1055,11 @@ class Generator {
   }
 
   Value emit_expr(const Expr& expression) {
+    for (auto frame = loop_value_bindings_.rbegin();
+         frame != loop_value_bindings_.rend(); ++frame) {
+      for (const LoopValueBinding& binding : *frame)
+        if (expressions_equivalent(*binding.expression, expression)) return binding.value;
+    }
     if (options_.optimization == OptimizationLevel::O1 && inline_bindings_.empty()) {
       auto folded = eval_const(expression);
       if (folded) return immediate(*folded);
@@ -2040,6 +2159,97 @@ class Generator {
     return true;
   }
 
+  bool expression_is_pure_scalar(const Expr& expression) const {
+    if (expression.kind == ExprKind::Subscript || expression.kind == ExprKind::String)
+      return false;
+    if (expression.kind == ExprKind::Call && !pure_functions_.count(expression.text))
+      return false;
+    if (expression.kind == ExprKind::Name) {
+      auto global = globals_by_name_.find(expression.text);
+      if (global != globals_by_name_.end() && !global->second.constant) return false;
+    }
+    if (expression.left && !expression_is_pure_scalar(*expression.left)) return false;
+    if (expression.right && !expression_is_pure_scalar(*expression.right)) return false;
+    for (const auto& argument : expression.args)
+      if (!expression_is_pure_scalar(*argument)) return false;
+    return true;
+  }
+
+  bool expression_contains_impure_call(const Expr& expression) const {
+    if (expression.kind == ExprKind::Call && !pure_functions_.count(expression.text))
+      return true;
+    if (expression.left && expression_contains_impure_call(*expression.left)) return true;
+    if (expression.right && expression_contains_impure_call(*expression.right)) return true;
+    for (const auto& argument : expression.args)
+      if (expression_contains_impure_call(*argument)) return true;
+    return false;
+  }
+
+  bool initializer_contains_impure_call(const Initializer& initializer) const {
+    if (initializer.expression && expression_contains_impure_call(*initializer.expression))
+      return true;
+    for (const auto& element : initializer.elements)
+      if (initializer_contains_impure_call(*element)) return true;
+    return false;
+  }
+
+  void collect_invariant_pure_calls(
+      const Expr& expression, const std::unordered_set<std::string>& excluded,
+      std::vector<const Expr*>& calls) const {
+    if (calls.size() >= 8 ||
+        (expression.kind == ExprKind::Binary &&
+         (expression.text == "&&" || expression.text == "||")))
+      return;
+    if (expression.kind == ExprKind::Call && expression_is_pure_scalar(expression) &&
+        !expression_uses_any_name(expression, excluded)) {
+      const bool duplicate = std::any_of(calls.begin(), calls.end(), [&](const Expr* call) {
+        return expressions_equivalent(*call, expression);
+      });
+      if (!duplicate) calls.push_back(&expression);
+      return;
+    }
+    if (expression.left) collect_invariant_pure_calls(*expression.left, excluded, calls);
+    if (expression.right) collect_invariant_pure_calls(*expression.right, excluded, calls);
+    for (const auto& argument : expression.args)
+      collect_invariant_pure_calls(*argument, excluded, calls);
+  }
+
+  void collect_guaranteed_loop_pure_calls(
+      const Stmt& statement, const std::unordered_set<std::string>& excluded,
+      std::vector<const Expr*>& calls) const {
+    if (statement.kind == StmtKind::Block) {
+      for (const auto& child : statement.statements) {
+        if (child->kind == StmtKind::Empty) continue;
+        if (child->kind != StmtKind::Expression && child->kind != StmtKind::Assignment &&
+            child->kind != StmtKind::Declaration) return;
+        collect_guaranteed_loop_pure_calls(*child, excluded, calls);
+        return;
+      }
+      return;
+    }
+    if ((statement.expression && expression_contains_impure_call(*statement.expression)) ||
+        (statement.value && expression_contains_impure_call(*statement.value)))
+      return;
+    for (const VarDecl& declaration : statement.declarations)
+      if (declaration.initializer &&
+          initializer_contains_impure_call(*declaration.initializer))
+        return;
+    if (statement.expression)
+      collect_invariant_pure_calls(*statement.expression, excluded, calls);
+    if (statement.value) collect_invariant_pure_calls(*statement.value, excluded, calls);
+    for (const VarDecl& declaration : statement.declarations) {
+      if (!declaration.initializer) continue;
+      std::vector<const Initializer*> pending{declaration.initializer.get()};
+      while (!pending.empty()) {
+        const Initializer* current = pending.back();
+        pending.pop_back();
+        if (current->expression)
+          collect_invariant_pure_calls(*current->expression, excluded, calls);
+        for (const auto& element : current->elements) pending.push_back(element.get());
+      }
+    }
+  }
+
   bool initializer_contains_call(const Initializer& initializer) const {
     if (initializer.expression && expression_contains_call(*initializer.expression)) return true;
     for (const auto& element : initializer.elements)
@@ -2376,10 +2586,12 @@ class Generator {
         const std::string body = new_label("while_body");
         const std::string done = new_label("while_done");
         std::vector<LoopAddressBinding> address_bindings;
+        std::vector<const Expr*> invariant_calls;
         if (options_.optimization == OptimizationLevel::O1) {
           std::unordered_set<std::string> excluded;
           bool has_call = false;
           collect_loop_excluded_names(*statement.first, excluded, has_call);
+          collect_guaranteed_loop_pure_calls(*statement.first, excluded, invariant_calls);
           if (auto induction = loop_unit_induction(statement)) {
             std::vector<std::pair<const Expr*, std::uint64_t>> induction_addresses;
             std::unordered_set<std::string> varying = excluded;
@@ -2421,14 +2633,33 @@ class Generator {
             }
           }
         }
-        line("j " + test);
+        std::vector<LoopValueBinding> value_bindings;
+        if (!invariant_calls.empty()) {
+          emit_cond_fallthrough_true(*statement.expression, done);
+          for (const Expr* call : invariant_calls) {
+            Value value = emit_expr(*call);
+            if (value.type.base == BaseType::Float) {
+              load_float(value, "ft0");
+              value = store_float_temp("ft0", false);
+            } else {
+              load_int(value, "t0");
+              value = store_int_temp("t0", false);
+            }
+            value_bindings.push_back(LoopValueBinding{call, std::move(value)});
+          }
+          line("j " + body);
+        } else {
+          line("j " + test);
+        }
         label(body);
         loop_address_bindings_.push_back(std::move(address_bindings));
+        loop_value_bindings_.push_back(std::move(value_bindings));
         break_labels_.push_back(done);
         continue_labels_.push_back(test);
         emit_stmt(*statement.first);
         continue_labels_.pop_back();
         break_labels_.pop_back();
+        loop_value_bindings_.pop_back();
         for (const LoopAddressBinding& binding : loop_address_bindings_.back())
           if (binding.register_index)
             release_loop_pointer_register(*binding.register_index);
@@ -2775,6 +3006,7 @@ class Generator {
   std::unordered_map<std::string, FunctionSig> functions_;
   std::unordered_map<std::string, const Function*> function_defs_;
   std::unordered_set<std::string> user_functions_;
+  std::unordered_set<std::string> pure_functions_;
   std::unordered_map<std::string, Symbol> globals_by_name_;
   std::vector<GlobalObject> globals_;
   std::vector<std::unordered_map<std::string, Symbol>> scopes_;
@@ -2813,7 +3045,12 @@ class Generator {
     std::string induction_name;
     std::uint64_t advance_bytes{};
   };
+  struct LoopValueBinding {
+    const Expr* expression{};
+    Value value;
+  };
   std::vector<std::vector<LoopAddressBinding>> loop_address_bindings_;
+  std::vector<std::vector<LoopValueBinding>> loop_value_bindings_;
   std::array<bool, 11> active_loop_int_registers_{};
   std::array<bool, 4> active_loop_caller_registers_{};
   std::set<std::size_t> reusable_loop_int_registers_;

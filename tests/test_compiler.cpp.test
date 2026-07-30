@@ -347,6 +347,99 @@ void test_o1_inducts_the_complete_multidimensional_address() {
   CHECK(contains(result.assembly, "addi a4, a4, 64"));
 }
 
+void test_o1_hoists_loop_invariant_pure_calls() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int power(int a, int b) {
+      if (b == 0) return 1;
+      return a * power(a, b - 1);
+    }
+    int values[16];
+    int main() {
+      int d = 3;
+      int i = 0;
+      while (i < 16) {
+        values[i] = values[i] * power(d, 5);
+        i = i + 1;
+      }
+      return values[0];
+    }
+  )", "pure-call-licm.sy", options);
+  CHECK(result.ok);
+  CHECK(count_occurrences(result.assembly, "call power") == 2);
+  const std::size_t hoisted = result.assembly.rfind("call power");
+  const std::size_t loop_body = result.assembly.find(".Lmain_while_body");
+  const std::size_t zero_trip_guard = result.assembly.rfind("while_done", hoisted);
+  CHECK(zero_trip_guard < hoisted);
+  CHECK(hoisted < loop_body);
+}
+
+void test_o1_does_not_hoist_impure_calls() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int values[4];
+    int main() {
+      int i = 0;
+      while (i < 4) {
+        values[i] = getint();
+        i = i + 1;
+      }
+      return values[0];
+    }
+  )", "impure-call-licm.sy", options);
+  CHECK(result.ok);
+  const std::size_t call = result.assembly.find("call getint");
+  const std::size_t loop_body = result.assembly.find(".Lmain_while_body");
+  CHECK(call > loop_body);
+}
+
+void test_o1_does_not_hoist_pure_calls_with_impure_arguments() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int square(int x) { return x * x; }
+    int values[4];
+    int main() {
+      int i = 0;
+      while (i < 4) {
+        values[i] = square(getint());
+        i = i + 1;
+      }
+      return values[0];
+    }
+  )", "impure-call-argument-licm.sy", options);
+  CHECK(result.ok);
+  const std::size_t call = result.assembly.find("call getint");
+  const std::size_t loop_body = result.assembly.find(".Lmain_while_body");
+  CHECK(call > loop_body);
+}
+
+void test_o1_does_not_reorder_pure_and_impure_calls() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    int power(int a, int b) {
+      if (b == 0) return 1;
+      return a * power(a, b - 1);
+    }
+    int main() {
+      int i = 0;
+      int sum = 0;
+      while (i < 4) {
+        sum = sum + getint() + power(2, 5);
+        i = i + 1;
+      }
+      return sum;
+    }
+  )", "mixed-call-licm.sy", options);
+  CHECK(result.ok);
+  const std::size_t power = result.assembly.rfind("call power");
+  const std::size_t loop_body = result.assembly.find(".Lmain_while_body");
+  CHECK(power > loop_body);
+}
+
 void test_o1_strength_reduces_signed_power_of_two_division() {
   sysy::CompileOptions options;
   options.optimization = sysy::OptimizationLevel::O1;
@@ -667,6 +760,10 @@ int main() {
   test_o1_does_not_save_global_array_bases_in_recursive_frames();
   test_o1_strength_reduces_loop_array_addresses_to_pointer_increments();
   test_o1_inducts_the_complete_multidimensional_address();
+  test_o1_hoists_loop_invariant_pure_calls();
+  test_o1_does_not_hoist_impure_calls();
+  test_o1_does_not_hoist_pure_calls_with_impure_arguments();
+  test_o1_does_not_reorder_pure_and_impure_calls();
   test_o1_strength_reduces_signed_power_of_two_division();
   test_o1_keeps_array_values_and_destinations_in_scratch_registers();
   test_o1_caches_hot_global_array_bases();
