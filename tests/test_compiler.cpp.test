@@ -619,6 +619,29 @@ void test_o1_invalidates_array_dependent_pure_calls_after_array_write() {
   CHECK(count_occurrences(result.assembly, "call helper") == 2);
 }
 
+void test_o1_emits_guarded_fast_path_for_recursive_modular_multiply() {
+  sysy::CompileOptions options;
+  options.optimization = sysy::OptimizationLevel::O1;
+  auto result = sysy::compile_source(R"(
+    const int mod = 998244353;
+    int modular_multiply(int a, int b) {
+      if (b == 0) return 0;
+      if (b == 1) return a % mod;
+      int cur = modular_multiply(a, b / 2);
+      cur = (cur + cur) % mod;
+      if (b % 2 == 1) return (cur + a) % mod;
+      else return cur;
+    }
+    int main() { return modular_multiply(123, 456); }
+  )", "recursive-modular-multiply.sy", options);
+  CHECK(result.ok);
+  CHECK(contains(result.assembly, "# sysy-fast-modular-multiply"));
+  CHECK(contains(result.assembly, "mul t0, t0, t1"));
+  CHECK(contains(result.assembly, "rem t0, t0, t2"));
+  CHECK(contains(result.assembly, "bltz t1"));
+  CHECK(contains(result.assembly, "call modular_multiply"));
+}
+
 void test_o1_strength_reduces_signed_power_of_two_division() {
   sysy::CompileOptions options;
   options.optimization = sysy::OptimizationLevel::O1;
@@ -951,6 +974,7 @@ int main() {
   test_o1_does_not_reuse_pure_calls_across_io();
   test_o1_reuses_pure_calls_with_identical_array_reads_before_writeback();
   test_o1_invalidates_array_dependent_pure_calls_after_array_write();
+  test_o1_emits_guarded_fast_path_for_recursive_modular_multiply();
   test_o1_strength_reduces_signed_power_of_two_division();
   test_o1_keeps_array_values_and_destinations_in_scratch_registers();
   test_o1_caches_hot_global_array_bases();

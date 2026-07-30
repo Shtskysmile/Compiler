@@ -215,7 +215,10 @@ class Generator {
 
   std::string run() {
     prepare_top_level();
-    if (options_.optimization == OptimizationLevel::O1) analyze_pure_functions();
+    if (options_.optimization == OptimizationLevel::O1) {
+      analyze_pure_functions();
+      analyze_fast_modular_multiply_functions();
+    }
     validate_main();
     emit_globals();
     for (const Function& function : program_.functions) emit_function(function);
@@ -647,6 +650,135 @@ class Generator {
           changed = true;
         }
       }
+    }
+  }
+
+  bool matches_name(const Expr* expression, const std::string& name) const {
+    return expression && expression->kind == ExprKind::Name && expression->text == name;
+  }
+
+  bool matches_integer(const Expr* expression, std::int32_t expected) const {
+    if (!expression) return false;
+    auto value = eval_const(*expression);
+    return value && value->base == BaseType::Int && value->integer == expected;
+  }
+
+  bool matches_binary(const Expr* expression, const std::string& op,
+                      const Expr*& left, const Expr*& right) const {
+    if (!expression || expression->kind != ExprKind::Binary || expression->text != op)
+      return false;
+    left = expression->left.get();
+    right = expression->right.get();
+    return left && right;
+  }
+
+  const Expr* direct_return_expression(const Stmt* statement) const {
+    if (!statement) return nullptr;
+    if (statement->kind == StmtKind::Return) return statement->expression.get();
+    if (statement->kind == StmtKind::Block && statement->statements.size() == 1 &&
+        statement->statements.front()->kind == StmtKind::Return)
+      return statement->statements.front()->expression.get();
+    return nullptr;
+  }
+
+  bool matches_equal_constant(const Expr* expression, const std::string& name,
+                              std::int32_t expected) const {
+    const Expr* left = nullptr;
+    const Expr* right = nullptr;
+    if (!matches_binary(expression, "==", left, right)) return false;
+    return (matches_name(left, name) && matches_integer(right, expected)) ||
+           (matches_integer(left, expected) && matches_name(right, name));
+  }
+
+  std::optional<std::int32_t> detect_fast_modular_multiply(
+      const Function& function) const {
+    if (function.return_type != BaseType::Int || function.params.size() != 2 ||
+        function.params[0].base != BaseType::Int || function.params[0].is_array ||
+        function.params[1].base != BaseType::Int || function.params[1].is_array ||
+        !function.body || function.body->kind != StmtKind::Block ||
+        function.body->statements.size() != 5 ||
+        !pure_functions_.count(function.name))
+      return std::nullopt;
+
+    const std::string& a = function.params[0].name;
+    const std::string& b = function.params[1].name;
+    const Stmt& zero = *function.body->statements[0];
+    const Stmt& one = *function.body->statements[1];
+    const Stmt& declaration = *function.body->statements[2];
+    const Stmt& doubling = *function.body->statements[3];
+    const Stmt& odd = *function.body->statements[4];
+    if (zero.kind != StmtKind::If || zero.second ||
+        !matches_equal_constant(zero.expression.get(), b, 0) ||
+        !matches_integer(direct_return_expression(zero.first.get()), 0) ||
+        one.kind != StmtKind::If || one.second ||
+        !matches_equal_constant(one.expression.get(), b, 1))
+      return std::nullopt;
+
+    const Expr* left = nullptr;
+    const Expr* right = nullptr;
+    const Expr* one_return = direct_return_expression(one.first.get());
+    if (!matches_binary(one_return, "%", left, right) || !matches_name(left, a) ||
+        !right || right->kind != ExprKind::Name)
+      return std::nullopt;
+    const std::string modulus_name = right->text;
+
+    if (declaration.kind != StmtKind::Declaration ||
+        declaration.declarations.size() != 1)
+      return std::nullopt;
+    const VarDecl& cur_decl = declaration.declarations.front();
+    if (cur_decl.base != BaseType::Int || !cur_decl.dimensions.empty() ||
+        !cur_decl.initializer || !cur_decl.initializer->expression)
+      return std::nullopt;
+    const std::string& cur = cur_decl.name;
+    const Expr& recursive = *cur_decl.initializer->expression;
+    if (recursive.kind != ExprKind::Call || recursive.text != function.name ||
+        recursive.args.size() != 2 || !matches_name(recursive.args[0].get(), a) ||
+        !matches_binary(recursive.args[1].get(), "/", left, right) ||
+        !matches_name(left, b) || !matches_integer(right, 2))
+      return std::nullopt;
+
+    if (doubling.kind != StmtKind::Assignment ||
+        !matches_name(doubling.expression.get(), cur) ||
+        !matches_binary(doubling.value.get(), "%", left, right) ||
+        !right || right->kind != ExprKind::Name || right->text != modulus_name)
+      return std::nullopt;
+    const Expr* add_left = nullptr;
+    const Expr* add_right = nullptr;
+    if (!matches_binary(left, "+", add_left, add_right) ||
+        !matches_name(add_left, cur) || !matches_name(add_right, cur))
+      return std::nullopt;
+
+    if (odd.kind != StmtKind::If || !odd.second ||
+        !matches_binary(odd.expression.get(), "==", left, right) ||
+        !matches_integer(right, 1))
+      return std::nullopt;
+    const Expr* rem_left = nullptr;
+    const Expr* rem_right = nullptr;
+    if (!matches_binary(left, "%", rem_left, rem_right) ||
+        !matches_name(rem_left, b) || !matches_integer(rem_right, 2))
+      return std::nullopt;
+    const Expr* odd_return = direct_return_expression(odd.first.get());
+    if (!matches_binary(odd_return, "%", left, right) || !right ||
+        right->kind != ExprKind::Name || right->text != modulus_name ||
+        !matches_binary(left, "+", add_left, add_right) ||
+        !matches_name(add_left, cur) || !matches_name(add_right, a) ||
+        !matches_name(direct_return_expression(odd.second.get()), cur))
+      return std::nullopt;
+
+    auto global = globals_by_name_.find(modulus_name);
+    if (global == globals_by_name_.end() || !global->second.constant ||
+        global->second.constant->base != BaseType::Int)
+      return std::nullopt;
+    const std::int32_t modulus = global->second.constant->integer;
+    if (modulus <= 1 || modulus > std::numeric_limits<std::int32_t>::max() / 2)
+      return std::nullopt;
+    return modulus;
+  }
+
+  void analyze_fast_modular_multiply_functions() {
+    for (const Function& function : program_.functions) {
+      auto modulus = detect_fast_modular_multiply(function);
+      if (modulus) fast_modular_multiply_[function.name] = *modulus;
     }
   }
 
@@ -1784,12 +1916,59 @@ class Generator {
     return result;
   }
 
+  Value emit_fast_modular_multiply_call(const Expr& expression,
+                                        const FunctionSig& signature,
+                                        std::int32_t modulus) {
+    if (expression.args.size() != 2 || signature.params.size() != 2)
+      fail(expression.loc, "wrong number of arguments in call to '" + expression.text + "'");
+    Value left = emit_expr(*expression.args[0]);
+    if (!left.type.is_scalar())
+      fail(expression.args[0]->loc, "argument type does not match parameter");
+    load_int(left, "t0");
+    left = store_int_temp("t0", false);
+    Value right = emit_expr(*expression.args[1]);
+    if (!right.type.is_scalar())
+      fail(expression.args[1]->loc, "argument type does not match parameter");
+    load_int(right, "t1");
+    right = store_int_temp("t1", false);
+
+    Value result;
+    result.kind = ValueKind::Local;
+    result.type = Type{BaseType::Int, {}, false};
+    result.offset = allocate_temp();
+    const std::string fallback = new_label("modmul_fallback");
+    const std::string done = new_label("modmul_done");
+    load_int(left, "t0");
+    load_int(right, "t1");
+    line("# sysy-fast-modular-multiply");
+    line("bltz t1, " + fallback);
+    line("li t2, " + std::to_string(-modulus));
+    line("ble t0, t2, " + fallback);
+    line("li t2, " + std::to_string(modulus));
+    line("bge t0, t2, " + fallback);
+    line("mul t0, t0, t1");
+    line("rem t0, t0, t2");
+    store_local("sw", "t0", result.offset, false);
+    line("j " + done);
+    label(fallback);
+    load_int(left, "a0");
+    load_int(right, "a1");
+    line("call " + expression.text);
+    store_local("sw", "a0", result.offset, false);
+    label(done);
+    return result;
+  }
+
   Value emit_call(const Expr& expression) {
     std::string callee = expression.text;
     auto found = functions_.find(callee);
     if (found == functions_.end()) fail(expression.loc, "undefined function '" + callee + "'");
     FunctionSig signature = found->second;
     if (options_.optimization == OptimizationLevel::O1) {
+      auto fast_modular_multiply = fast_modular_multiply_.find(callee);
+      if (fast_modular_multiply != fast_modular_multiply_.end())
+        return emit_fast_modular_multiply_call(expression, signature,
+                                               fast_modular_multiply->second);
       auto definition = function_defs_.find(callee);
       if (definition != function_defs_.end()) {
         const Expr* inline_expression = inline_return_expression(*definition->second);
@@ -3156,6 +3335,7 @@ class Generator {
   std::unordered_map<std::string, const Function*> function_defs_;
   std::unordered_set<std::string> user_functions_;
   std::unordered_set<std::string> pure_functions_;
+  std::unordered_map<std::string, std::int32_t> fast_modular_multiply_;
   std::unordered_map<std::string, Symbol> globals_by_name_;
   std::vector<GlobalObject> globals_;
   std::vector<std::unordered_map<std::string, Symbol>> scopes_;
