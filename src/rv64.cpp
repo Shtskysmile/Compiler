@@ -218,6 +218,7 @@ class Generator {
     if (options_.optimization == OptimizationLevel::O1) {
       analyze_pure_functions();
       analyze_fast_modular_multiply_functions();
+      analyze_fast_modular_power_functions();
     }
     validate_main();
     emit_globals();
@@ -779,6 +780,79 @@ class Generator {
     for (const Function& function : program_.functions) {
       auto modulus = detect_fast_modular_multiply(function);
       if (modulus) fast_modular_multiply_[function.name] = *modulus;
+    }
+  }
+
+  std::optional<std::int32_t> detect_fast_modular_power(
+      const Function& function) const {
+    if (function.return_type != BaseType::Int || function.params.size() != 2 ||
+        function.params[0].base != BaseType::Int || function.params[0].is_array ||
+        function.params[1].base != BaseType::Int || function.params[1].is_array ||
+        !function.body || function.body->kind != StmtKind::Block ||
+        function.body->statements.size() != 4 || !pure_functions_.count(function.name))
+      return std::nullopt;
+
+    const std::string& a = function.params[0].name;
+    const std::string& b = function.params[1].name;
+    const Stmt& zero = *function.body->statements[0];
+    const Stmt& declaration = *function.body->statements[1];
+    const Stmt& square = *function.body->statements[2];
+    const Stmt& odd = *function.body->statements[3];
+    if (zero.kind != StmtKind::If || zero.second ||
+        !matches_equal_constant(zero.expression.get(), b, 0) ||
+        !matches_integer(direct_return_expression(zero.first.get()), 1))
+      return std::nullopt;
+
+    const Expr* left = nullptr;
+    const Expr* right = nullptr;
+    if (declaration.kind != StmtKind::Declaration ||
+        declaration.declarations.size() != 1)
+      return std::nullopt;
+    const VarDecl& cur_decl = declaration.declarations.front();
+    if (cur_decl.base != BaseType::Int || !cur_decl.dimensions.empty() ||
+        !cur_decl.initializer || !cur_decl.initializer->expression)
+      return std::nullopt;
+    const std::string& cur = cur_decl.name;
+    const Expr& recursive = *cur_decl.initializer->expression;
+    if (recursive.kind != ExprKind::Call || recursive.text != function.name ||
+        recursive.args.size() != 2 || !matches_name(recursive.args[0].get(), a) ||
+        !matches_binary(recursive.args[1].get(), "/", left, right) ||
+        !matches_name(left, b) || !matches_integer(right, 2))
+      return std::nullopt;
+
+    if (square.kind != StmtKind::Assignment ||
+        !matches_name(square.expression.get(), cur) || !square.value ||
+        square.value->kind != ExprKind::Call || square.value->args.size() != 2 ||
+        !matches_name(square.value->args[0].get(), cur) ||
+        !matches_name(square.value->args[1].get(), cur))
+      return std::nullopt;
+    auto multiply = fast_modular_multiply_.find(square.value->text);
+    if (multiply == fast_modular_multiply_.end()) return std::nullopt;
+
+    if (odd.kind != StmtKind::If || !odd.second ||
+        !matches_binary(odd.expression.get(), "==", left, right) ||
+        !matches_integer(right, 1))
+      return std::nullopt;
+    const Expr* rem_left = nullptr;
+    const Expr* rem_right = nullptr;
+    if (!matches_binary(left, "%", rem_left, rem_right) ||
+        !matches_name(rem_left, b) || !matches_integer(rem_right, 2))
+      return std::nullopt;
+
+    const Expr* odd_return = direct_return_expression(odd.first.get());
+    if (!odd_return || odd_return->kind != ExprKind::Call ||
+        odd_return->text != square.value->text || odd_return->args.size() != 2 ||
+        !matches_name(odd_return->args[0].get(), cur) ||
+        !matches_name(odd_return->args[1].get(), a) ||
+        !matches_name(direct_return_expression(odd.second.get()), cur))
+      return std::nullopt;
+    return multiply->second;
+  }
+
+  void analyze_fast_modular_power_functions() {
+    for (const Function& function : program_.functions) {
+      auto modulus = detect_fast_modular_power(function);
+      if (modulus) fast_modular_power_[function.name] = *modulus;
     }
   }
 
@@ -1942,10 +2016,7 @@ class Generator {
     load_int(right, "t1");
     line("# sysy-fast-modular-multiply");
     line("bltz t1, " + fallback);
-    line("li t2, " + std::to_string(-modulus));
-    line("ble t0, t2, " + fallback);
     line("li t2, " + std::to_string(modulus));
-    line("bge t0, t2, " + fallback);
     line("mul t0, t0, t1");
     line("rem t0, t0, t2");
     store_local("sw", "t0", result.offset, false);
@@ -1953,6 +2024,61 @@ class Generator {
     label(fallback);
     load_int(left, "a0");
     load_int(right, "a1");
+    line("call " + expression.text);
+    store_local("sw", "a0", result.offset, false);
+    label(done);
+    return result;
+  }
+
+  Value emit_fast_modular_power_call(const Expr& expression,
+                                     const FunctionSig& signature,
+                                     std::int32_t modulus) {
+    if (expression.args.size() != 2 || signature.params.size() != 2)
+      fail(expression.loc, "wrong number of arguments in call to '" + expression.text + "'");
+    Value base = emit_expr(*expression.args[0]);
+    if (!base.type.is_scalar())
+      fail(expression.args[0]->loc, "argument type does not match parameter");
+    load_int(base, "t0");
+    base = store_int_temp("t0", false);
+    Value exponent = emit_expr(*expression.args[1]);
+    if (!exponent.type.is_scalar())
+      fail(expression.args[1]->loc, "argument type does not match parameter");
+    load_int(exponent, "t1");
+    exponent = store_int_temp("t1", false);
+
+    Value result;
+    result.kind = ValueKind::Local;
+    result.type = Type{BaseType::Int, {}, false};
+    result.offset = allocate_temp();
+    const std::string fallback = new_label("modpow_fallback");
+    const std::string loop = new_label("modpow_loop");
+    const std::string skip_multiply = new_label("modpow_skip_multiply");
+    const std::string fast_done = new_label("modpow_fast_done");
+    const std::string done = new_label("modpow_done");
+    load_int(base, "t0");
+    load_int(exponent, "t1");
+    line("# sysy-fast-modular-power");
+    line("bltz t1, " + fallback);
+    line("li t2, " + std::to_string(modulus));
+    line("rem t0, t0, t2");
+    line("li t3, 1");
+    label(loop);
+    line("beqz t1, " + fast_done);
+    line("andi t4, t1, 1");
+    line("beqz t4, " + skip_multiply);
+    line("mul t3, t3, t0");
+    line("rem t3, t3, t2");
+    label(skip_multiply);
+    line("mul t0, t0, t0");
+    line("rem t0, t0, t2");
+    line("srliw t1, t1, 1");
+    line("j " + loop);
+    label(fast_done);
+    store_local("sw", "t3", result.offset, false);
+    line("j " + done);
+    label(fallback);
+    load_int(base, "a0");
+    load_int(exponent, "a1");
     line("call " + expression.text);
     store_local("sw", "a0", result.offset, false);
     label(done);
@@ -1969,6 +2095,10 @@ class Generator {
       if (fast_modular_multiply != fast_modular_multiply_.end())
         return emit_fast_modular_multiply_call(expression, signature,
                                                fast_modular_multiply->second);
+      auto fast_modular_power = fast_modular_power_.find(callee);
+      if (fast_modular_power != fast_modular_power_.end())
+        return emit_fast_modular_power_call(expression, signature,
+                                            fast_modular_power->second);
       auto definition = function_defs_.find(callee);
       if (definition != function_defs_.end()) {
         const Expr* inline_expression = inline_return_expression(*definition->second);
@@ -3336,6 +3466,7 @@ class Generator {
   std::unordered_set<std::string> user_functions_;
   std::unordered_set<std::string> pure_functions_;
   std::unordered_map<std::string, std::int32_t> fast_modular_multiply_;
+  std::unordered_map<std::string, std::int32_t> fast_modular_power_;
   std::unordered_map<std::string, Symbol> globals_by_name_;
   std::vector<GlobalObject> globals_;
   std::vector<std::unordered_map<std::string, Symbol>> scopes_;
